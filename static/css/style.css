@@ -1,0 +1,271 @@
+/* Reset default styles and set global font */
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: 'Roboto', sans-serif;
+    background-color: #1e1e2f;
+    color: #e0e0e0;
+    line-height: 1.6;
+    display: flex;
+    flex-direction: column;
+    min-height: 100vh;
+}
+
+/* Headings */
+h1,
+h2 {
+    color: #ffffff;
+    text-align: center;
+    margin-bottom: 20px;
+}
+
+/* Container for main sections */
+.container {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 20px;
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 30px;
+}
+
+/* Date Range Form Section */
+.date-range-form {
+    background-color: #2a2a3d;
+    padding: 25px;
+    border-radius: 10px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+}
+
+/* Map Styling */
+#map {
+    height: 400px;
+    width: 100%;
+    border-radius: 5px;
+    overflow: hidden;
+    position: relative;
+}
+
+/* Form Styling */
+.date-range-form form {
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+    align-items: center;
+}
+
+.date-range-form label {
+    font-size: 1.1rem;
+    color: #a0a0cc;
+}
+
+.date-range-form input[type="date"] {
+    width: 100%;
+    max-width: 300px;
+    padding: 12px;
+    font-size: 1rem;
+    border: 1px solid #3f3f5e;
+    border-radius: 5px;
+    background-color: #35354f;
+    color: #e0e0e0;
+    transition: border-color 0.3s ease;
+}
+
+.date-range-form input:focus {
+    outline: none;
+    border-color: #6b6bff;
+}
+
+.date-range-form button {
+    padding: 12px 30px;
+    background-color: #6b6bff;
+    color: #ffffff;
+    border: none;
+    border-radius: 5px;
+    font-size: 1.1rem;
+    cursor: pointer;
+    transition: background-color 0.3s ease, transform 0.2s ease;
+}
+
+.date-range-form button:hover {
+    background-color: #5757d9;
+    transform: translateY(-2px);
+}
+
+/* Credits and Timer Info */
+#credits-info,
+#timer {
+    font-size: 1rem;
+    color: #a0a0cc;
+    text-align: center;
+}
+
+/* Instructions Section */
+.instructions {
+    background-color: #2a2a3d;
+    padding: 25px;
+    border-radius: 10px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+}
+
+.instructions ol {
+    padding-left: 25px;
+}
+
+.instructions li {
+    margin-bottom: 15px;
+}
+
+.instructions a {
+    color: #6b6bff;
+    text-decoration: none;
+    transition: color 0.3s ease;
+}
+
+.instructions a:hover {
+    color: #ffffff;
+}
+
+/* Log Feed Section */
+#log-feed {
+    background-color: #2a2a3d;
+    padding: 25px;
+    border-radius: 10px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+    flex-grow: 1;
+}
+
+#log-output {
+    background-color: #1e1e2f;
+    padding: 15px;
+    border: 1px solid #3f3f5e;
+    border-radius: 5px;
+    height: 200px;
+    overflow-y: auto;
+    font-family: 'Courier New', monospace;
+    font-size: 0.9rem;
+    color: #b0b0d0;
+}
+
+/* Results Section */
+#result {
+    background-color: #2a2a3d;
+    padding: 25px;
+    border-radius: 10px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+}
+
+#retrain-btn,
+#rerun-btn {
+    padding: 12px 30px;
+    margin: 10px;
+    background-color: #28a745;
+    color: #ffffff;
+    border: none;
+    border-radius: 5px;
+    font-size: 1.1rem;
+    cursor: pointer;
+    transition: background-color 0.3s ease, transform 0.2s ease;
+}
+
+#retrain-btn:hover,
+#rerun-btn:hover {
+    background-color: #218838;
+    transform: translateY(-2px);
+}
+
+.flight-entry {
+    display: flex;
+    align-items: center;
+    gap: 20px;
+    background-color: #35354f;
+    padding: 15px;
+    margin: 15px 0;
+    border-radius: 8px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+    transition: transform 0.2s ease;
+}
+
+.flight-entry:hover {
+    transform: translateY(-2px);
+}
+
+.flight-entry img {
+    max-width: 400px;
+    border-radius: 5px;
+}
+
+.flight-entry p {
+    margin: 5px 0;
+}
+
+.flight-entry select {
+    padding: 10px;
+    font-size: 1rem;
+    border: 1px solid #3f3f5e;
+    border-radius: 5px;
+    background-color: #35354f;
+    color: #e0e0e0;
+    cursor: pointer;
+    transition: border-color 0.3s ease;
+}
+
+.flight-entry select:focus {
+    outline: none;
+    border-color: #6b6bff;
+}
+
+/* Download Link */
+#download-link {
+    display: inline-block;
+    padding: 12px 30px;
+    background-color: #ff6b6b;
+    color: #ffffff;
+    text-decoration: none;
+    border-radius: 5px;
+    font-size: 1.1rem;
+    transition: background-color 0.3s ease, transform 0.2s ease;
+}
+
+#download-link:hover {
+    background-color: #e55a5a;
+    transform: translateY(-2px);
+}
+
+/* Responsive Design */
+@media (max-width: 768px) {
+    .container {
+        padding: 15px;
+    }
+
+    .date-range-form form {
+        gap: 15px;
+    }
+
+    #map {
+        height: 300px;
+    }
+
+    .flight-entry {
+        flex-direction: column;
+        align-items: flex-start;
+    }
+
+    .flight-entry img {
+        max-width: 100%;
+    }
+}
+
+.airplane-icon {
+    background: none;
+    border: none;
+    transform-origin: center center;
+}

@@ -1,0 +1,12 @@
+Flask
+pandas
+numpy
+matplotlib
+svgwrite
+pyopensky
+scikit-learn
+flask-socketio
+folium==0.16.0  # For interactive map
+requests==2.32.3  # For REST API calls
+pytest
+debugpy
