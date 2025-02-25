@@ -1,0 +1,49 @@
+We are going to build an app together. The main purpose of the app is to gather flight path data from opensky, plot it in a map for the user. 
+
+Opensky API:
+The openski api is limited in its use. Gathering data via the /api/states/all endpoint expends credits of which a total of 4000 is available pr day. depending on the size of the area defined in the request the credit cost ranges from 1 to 4. 
+
+Area square deg	Credits	Example
+0 - 25 (<500x500km)	1	/api/states/all?lamin=49.7&lamax=50.5&lomin=3.2&lomax=4.6
+25 - 100 (<1000x1000km)	2	/api/states/all?lamin=46.5&lamax=49.9&lomin=-1.4&lomax=6.8
+100 - 400 (<2000x2000km)	3	/api/states/all?lamin=42.2&lamax=49.8&lomin=-4.7&lomax=10.9
+over 400 or all (>2000x2000km)	4	/api/states/all
+
+The user can select an area from a world map in the UI and start monitoring the flight data in this area with a frequency defined from a dropdown menu by the user in the UI. values: 30s, 1m, 5m 
+
+Monitoring:
+The area selected for monitoring persists in a database. when the server starts the previously selected areas is loaded so the monitoring can continue. When monitoring the path analysis and classification is triggered when enough points have been gatheren for a perticular flight.
+While monitoring, the flights are drawn on the map with their recorded paths.
+
+Analysis:
+The path data is stored in a local database for further analysis. When analyzing the paths we are looking for paths that are not flights from a to b but other missions like survey or agriculture or the like. We detect the patterns by identifying if the pattern has a grid like pattern to it or other features that are not normally seen in domestic a to b flights. 
+Paths that are classified are also are visible in the UI with a svg based graphic for the path along with flight data and mission classification in a list below the map. This list is dynamically updated as the flight paths are updated with new data. 
+
+Classifications:
+The list of classification can be modified by the user via the UI. Classification are stored in the database. A comprehensive list of flight mission classification are provided to seed the database. 
+If the classification is automatically detected reclassification can occure automatically when the list of detected paths is updated. An indication of automatic classification is indicated with a small symbol. Manual classification is not overwritten.
+
+Machine learning:
+We use machine learning to improve the capability to classify patterns. When data has been gathered and analyzed it is used to train the ml model. The user can manually retrain after altering classifications via the UI.
+
+Tech stack:
+The application is written as a python app hosting a website for ui via a flask server.
+pyopensky is used to access and fetch data.  
+Logging from the python app is emitted to the UI via socketio. logs are available in the UI.
+The python app is structured as a package after best practices.
+The project is packaged in a dockerfile base on python:3.12-slim
+
+Debugging:
+debugpy is used to hookup vscode debugger to the docker
+
+The UI:
+The website styling is simple but modern in a dark theme and has smooth animations. 
+
+Databases:
+the database files are stored outside the container and is mounted in when the docker is started.
+
+Credentials:
+Opensky credentials are handled using a settings.conf file as described in 
+https://mode-s.org/pyopensky/credentials.html
+this is copied to /root/.config/pyopensky/ in the Dockerfile.
+
