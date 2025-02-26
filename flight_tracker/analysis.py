@@ -1,73 +1,106 @@
-from flight_tracker import logger
-import math
-import json
-import csv
-from flight_tracker.ml_model import predict_classification
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.utils.validation import check_is_fitted
+import numpy as np
+from flight_tracker.utils import logger
+from flight_tracker.ml_model import load_model, save_model
+import threading
+import time
 
-def calculate_distance(lat1, lon1, lat2, lon2):
-    """Calculate great-circle distance between two points in degrees."""
-    lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
-    dlat = lat2 - lat1
-    dlon = lon2 - lon1
-    a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
-    c = 2 * math.asin(math.sqrt(a))
-    return math.degrees(c)
+# Buffers for logs
+classification_log_buffer = []
+ml_failure_buffer = []
+buffer_lock = threading.Lock()
+first_ml_failure_logged = False  # Track if we've logged the detailed message once
 
-def classify_path(points):
-    """Rule-based classification as fallback."""
-    if len(points) < 3:
-        return None
+def flush_log_buffers(socketio):
+    """Emit buffered logs every 5 seconds."""
+    global first_ml_failure_logged
+    while True:
+        time.sleep(5)
+        with buffer_lock:
+            if classification_log_buffer:
+                socketio.emit('log', {'message': '\n'.join(classification_log_buffer)})
+                classification_log_buffer.clear()
+            if ml_failure_buffer:
+                count = len(ml_failure_buffer)
+                if not first_ml_failure_logged:
+                    # Log detailed message once
+                    socketio.emit('log', {'message': f"ML model not fitted or failed: {ml_failure_buffer[0]}"})
+                    first_ml_failure_logged = True
+                # Summarize subsequent failures
+                socketio.emit('log', {'message': f"ML not fitted for {count} flights, using rule-based fallback"})
+                ml_failure_buffer.clear()
 
-    direction_changes = 0
-    total_distance = 0
-    prev_angle = None
-    time_delta = points[-1][2] - points[0][2] if points[-1][2] and points[0][2] else 1
-    
-    for i in range(len(points) - 1):
-        lat1, lon1 = points[i][0], points[i][1]
-        lat2, lon2 = points[i + 1][0], points[i + 1][1]
-        distance = calculate_distance(lat1, lon1, lat2, lon2)
-        total_distance += distance
-
-        delta_lon = math.radians(lon2 - lon1)
-        lat1, lat2 = math.radians(lat1), math.radians(lat2)
-        y = math.sin(delta_lon) * math.cos(lat2)
-        x = math.cos(lat1) * math.sin(lat2) - math.sin(lat1) * math.cos(lat2) * math.cos(delta_lon)
-        angle = math.degrees(math.atan2(y, x))
-
-        if prev_angle is not None:
-            angle_diff = min(abs(angle - prev_angle), 360 - abs(angle - prev_angle))
-            if angle_diff > 30:
-                direction_changes += 1
-        prev_angle = angle
-
-    avg_speed = total_distance / (time_delta / 3600) if time_delta > 0 else 0
-    point_density = len(points) / total_distance if total_distance > 0 else 0
-
-    if direction_changes > len(points) / 3 and point_density > 5:
-        return "survey"
-    elif total_distance > 0.3 and direction_changes < 2 and avg_speed > 0.1:
-        return "a_to_b"
-    else:
-        return "other"
+def start_buffer_thread(socketio):
+    """Start the buffer flush thread."""
+    thread = threading.Thread(target=flush_log_buffers, args=(socketio,), daemon=True)
+    thread.start()
 
 def analyze_flight(flight):
-    """Classify flight using ML if available, otherwise use rule-based."""
-    classification = predict_classification(flight.points)
-    source = "ml" if classification else "rule"
-    
-    if classification is None:
-        logger.debug(f"No ML prediction for {flight.flight_id}, using rule-based classification")
-        classification = classify_path(flight.points)
+    if not hasattr(analyze_flight, 'model'):
+        analyze_flight.model = load_model() or RandomForestClassifier(n_estimators=100, random_state=42)
 
-    if classification:
-        flight.classification = classification
-        flight.classification_source = source
-        flight.auto_classified = True
-        logger.info(f"Classified flight {flight.flight_id} as {classification} ({source})")
-        latitudes = json.dumps([p[0] for p in flight.points])
-        longitudes = json.dumps([p[1] for p in flight.points])
-        with open('/data/flight_training_data.csv', 'a', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow([flight.flight_id, latitudes, longitudes, classification])
-    return classification
+    points = flight.points_list or []
+    if not points or len(points) < 2:
+        flight.classification = None
+        flight.classification_source = None
+        flight.auto_classified = False
+        return
+
+    valid_points = [p for p in points if isinstance(p, list) and len(p) >= 3]
+    if len(valid_points) < 2:
+        logger.warning(f"Invalid points data for flight {flight.flight_id}: {points}")
+        flight.classification = None
+        flight.classification_source = None
+        flight.auto_classified = False
+        return
+
+    altitudes = [p[3] if len(p) > 3 and p[3] != -1 else -1 for p in valid_points]
+    velocities = [p[4] if len(p) > 4 and p[4] != -1 else -1 for p in valid_points]
+    lat_lons = [(p[0], p[1]) for p in valid_points]
+    turns = 0
+    if len(lat_lons) > 2:
+        for i in range(len(lat_lons) - 2):
+            v1 = (lat_lons[i+1][0] - lat_lons[i][0], lat_lons[i+1][1] - lat_lons[i][1])
+            v2 = (lat_lons[i+2][0] - lat_lons[i+1][0], lat_lons[i+2][1] - lat_lons[i+1][1])
+            dot = v1[0] * v2[0] + v1[1] * v2[1]
+            mag1 = (v1[0]**2 + v1[1]**2)**0.5
+            mag2 = (v2[0]**2 + v2[1]**2)**0.5
+            if mag1 * mag2 > 0:
+                cos_angle = dot / (mag1 * mag2)
+                if cos_angle < 0.7:  # ~45° turn
+                    turns += 1
+
+    features = [
+        np.mean(altitudes) if any(a != -1 for a in altitudes) else -1,
+        np.mean(velocities) if any(v != -1 for v in velocities) else -1,
+        turns / len(valid_points) if valid_points else 0
+    ]
+
+    if features[0] > 5000 and features[1] > 100:
+        flight.classification = 'commercial'
+        flight.classification_source = 'rule'
+        flight.auto_classified = False
+    elif features[0] < 1000 and features[2] > 0.1:
+        flight.classification = 'survey'
+        flight.classification_source = 'rule'
+        flight.auto_classified = False
+    elif features[0] < 2000 and features[1] < 50:
+        flight.classification = 'cloud seeding'
+        flight.classification_source = 'rule'
+        flight.auto_classified = False
+    else:
+        try:
+            check_is_fitted(analyze_flight.model)
+            prediction = analyze_flight.model.predict([features])[0]
+            flight.classification = prediction
+            flight.classification_source = 'ml'
+            flight.auto_classified = True
+            with buffer_lock:
+                classification_log_buffer.append(f"Classified flight {flight.flight_id} as {prediction} (ML)")
+        except Exception as e:
+            with buffer_lock:
+                ml_failure_buffer.append(str(e))
+            flight.classification = None
+            flight.classification_source = None
+            flight.auto_classified = False

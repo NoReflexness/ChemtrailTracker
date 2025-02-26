@@ -1,6 +1,14 @@
 from flask_sqlalchemy import SQLAlchemy
+import json
 
 db = SQLAlchemy()
+
+def init_db(app):
+    app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:////data/flights.db'
+    app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+    db.init_app(app)
+    with app.app_context():
+        db.create_all()
 
 class MonitoredArea(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -9,18 +17,55 @@ class MonitoredArea(db.Model):
     lomin = db.Column(db.Float, nullable=False)
     lomax = db.Column(db.Float, nullable=False)
     frequency = db.Column(db.String(10), nullable=False)
+    is_monitoring = db.Column(db.Boolean, default=False)
 
 class FlightPath(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    flight_id = db.Column(db.String(50), nullable=False)
-    points = db.Column(db.JSON, nullable=False)
-    classification = db.Column(db.String(50), nullable=True)
-    auto_classified = db.Column(db.Boolean, default=False)
-    classification_source = db.Column(db.String(20), nullable=True)  # 'ml' or 'rule'
+    flight_id = db.Column(db.String(20), primary_key=True)
+    points = db.Column(db.Text, nullable=True)  # JSON-encoded list of [lat, lon, timestamp, alt, vel]
     last_updated = db.Column(db.Integer, nullable=False)
+    classification = db.Column(db.String(20))
+    classification_source = db.Column(db.String(20))
+    auto_classified = db.Column(db.Boolean, default=True)
+    avg_altitude = db.Column(db.Float, default=-1)
+    avg_velocity = db.Column(db.Float, default=-1)
+    duration = db.Column(db.Integer, default=0)
 
-def init_db(app):
-    app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:////data/flight_data.db'
-    db.init_app(app)
-    with app.app_context():
-        db.create_all()
+    def __init__(self, flight_id, points=None, last_updated=0):
+        self.flight_id = flight_id
+        self.points = json.dumps(points) if points else None
+        self.last_updated = last_updated
+        self.update_stats()
+
+    def update_stats(self):
+        if self.points:
+            points = json.loads(self.points) if isinstance(self.points, str) else self.points
+            normalized_points = []
+            for p in points:
+                if not isinstance(p, list):
+                    logger.warning(f"Invalid point format for {self.flight_id}: {p}")
+                    continue
+                while len(p) < 5:
+                    p.append(-1)
+                normalized_points.append(p)
+            self.points = json.dumps(normalized_points)
+            altitudes = [p[3] for p in normalized_points if p[3] != -1]
+            velocities = [p[4] for p in normalized_points if p[4] != -1]
+            timestamps = [p[2] for p in normalized_points]
+            self.avg_altitude = sum(altitudes) / len(altitudes) if altitudes else -1
+            self.avg_velocity = sum(velocities) / len(velocities) if velocities else -1
+            self.duration = max(timestamps) - min(timestamps) if len(timestamps) > 1 else 0
+
+    @property
+    def points_list(self):
+        if self.points:
+            points = json.loads(self.points) if isinstance(self.points, str) else self.points
+            normalized_points = []
+            for p in points:
+                if not isinstance(p, list):
+                    logger.warning(f"Invalid point format on read for {self.flight_id}: {p}")
+                    continue
+                while len(p) < 5:
+                    p.append(-1)
+                normalized_points.append(p)
+            return normalized_points
+        return []

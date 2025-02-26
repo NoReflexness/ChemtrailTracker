@@ -5,11 +5,12 @@
     <title>Flight Tracker Dashboard</title>
     <link rel="stylesheet" href="/static/style.css">
     <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+    <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
+    <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css" />
 </head>
 
 <body>
     <div class="dashboard">
-        <!-- Top Bar: Stats -->
         <header class="top-bar">
             <h1>Flight Tracker</h1>
             <div class="stats">
@@ -17,21 +18,18 @@
                 <span>Active Areas: <span id="area-count">0</span></span>
             </div>
         </header>
-
-        <!-- Main Content -->
         <div class="main-content">
-            <!-- Left: Map -->
             <div class="map-container">
                 <div id="map"></div>
                 <div class="legend">
-                    <div><span style="color: #808080;">⋯</span> Monitored Area</div>
-                    <div><span style="color: #00ff00;">■</span> A-to-B</div>
+                    <div><span style="color: #808080;">⋯</span> Disabled Area</div>
+                    <div><span style="color: #006400;">⋯</span> Monitored Area</div>
+                    <div><span style="color: #00ff00;">■</span> Commercial</div>
                     <div><span style="color: #ff0000;">■</span> Survey</div>
-                    <div><span style="color: #808080;">■</span> Other</div>
+                    <div><span style="color: #FFA500;">■</span> Agriculture</div>
+                    <div><span style="color: #0000FF;">■</span> Cloud Seeding</div>
                 </div>
             </div>
-
-            <!-- Right: Controls and Flight List -->
             <aside class="sidebar">
                 <div class="controls">
                     <h2>Controls</h2>
@@ -40,234 +38,69 @@
                         <option value="1m">1m</option>
                         <option value="5m">5m</option>
                     </select>
-                    <button onclick="startMonitoring()">Start Monitoring</button>
+                    <button id="monitor-btn" onclick="toggleMonitoring()">Start Monitoring</button>
+                    <button id="delete-btn" onclick="deleteArea()" disabled>Delete Area</button>
                     <button id="retrain-btn" onclick="retrainModel()" disabled>Retrain Model</button>
+                    <h3>Show Paths</h3>
+                    <select id="path-classes" multiple size="4" onchange="updateFlightPaths()">
+                        <option value="commercial" selected>Commercial</option>
+                        <option value="survey">Survey</option>
+                        <option value="agriculture">Agriculture</option>
+                        <option value="cloud seeding">Cloud Seeding</option>
+                    </select>
+                    <div class="add-class">
+                        <input type="text" id="new-class" placeholder="New classification">
+                        <button onclick="addClassification()">Add</button>
+                    </div>
                 </div>
                 <div class="flight-list">
                     <h2>Active Flights</h2>
+                    <input type="text" id="flight-filter" placeholder="Filter flights..." onkeyup="filterFlights()">
+                    <select id="class-filter" onchange="filterFlights()">
+                        <option value="">All Classifications</option>
+                        <option value="commercial">Commercial</option>
+                        <option value="survey">Survey</option>
+                        <option value="agriculture">Agriculture</option>
+                        <option value="cloud seeding">Cloud Seeding</option>
+                    </select>
                     <div id="flight-list-content"></div>
                 </div>
             </aside>
         </div>
-
-        <!-- Bottom: Logs -->
         <footer class="log-container">
             <h2>Logs</h2>
             <pre id="log"></pre>
         </footer>
     </div>
-
     <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
-    <script src="/static/map.js"></script>
+    <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
+    <script src="/static/js/simplify.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.5.1/socket.io.js"></script>
+    <script src="/static/js/utils.js"></script>
+    <script src="/static/js/map_init.js"></script>
+    <script src="/static/js/area_manager.js"></script>
+    <script src="/static/js/flight_renderer.js"></script>
+    <script src="/static/js/controls.js"></script>
+    <script src="/static/js/socket.js"></script>
     <script>
-        const socket = io();
-        let areas = [];
-        let currentArea = null;
-        const flightLines = {};
-        const flightLayer = L.layerGroup();
-        let canRetrain = false;
+        function addClassification() {
+            const input = document.getElementById('new-class');
+            const newClass = input.value.trim();
+            if (newClass && !Array.from(document.getElementById('path-classes').options).some(opt => opt.value === newClass)) {
+                const option = new Option(newClass, newClass);
+                document.getElementById('path-classes').add(option);
+                document.getElementById('class-filter').add(new Option(newClass, newClass));
+                input.value = '';
+                updateFlightPaths();
+            }
+        }
 
-        socket.on('log', (data) => {
-            const log = document.getElementById('log');
-            log.innerText += data.message + '\n';
-            log.scrollTop = log.scrollHeight;
+        document.addEventListener('DOMContentLoaded', () => {
+            initMap();
+            setupSocketEvents();
+            updateFlightPaths();
+            setInterval(updateFlightPaths, 10000);
         });
-
-        socket.on('flight_update', (flight) => {
-            const coords = flight.points.map(p => [p[0], p[1]]);
-            if (flightLines[flight.flight_id]) {
-                flightLayer.removeLayer(flightLines[flight.flight_id]);
-            }
-            const color = flight.classification === 'survey' ? '#ff0000' :
-                flight.classification === 'a_to_b' ? '#00ff00' : '#808080';
-            if (coords.length > 1) {
-                flightLines[flight.flight_id] = L.polyline(coords, { color: color, weight: 4 });
-                flightLines[flight.flight_id].bindPopup(`Flight: ${flight.flight_id}<br>Class: ${flight.classification || 'N/A'} (${flight.classification_source || 'N/A'})`);
-                flightLines[flight.flight_id].addTo(flightLayer);
-            } else {
-                flightLines[flight.flight_id] = L.marker(coords[0], { color: color });
-                flightLines[flight.flight_id].bindPopup(`Flight: ${flight.flight_id}<br>Class: ${flight.classification || 'N/A'} (${flight.classification_source || 'N/A'})`);
-                flightLines[flight.flight_id].addTo(flightLayer);
-            }
-            updateFlightList();
-            updateStats();
-        });
-
-        const map = L.map('map').setView([56.0, 11.0], 6);
-        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-            maxZoom: 19,
-        }).addTo(map);
-        flightLayer.addTo(map);
-
-        map.on('click', (e) => {
-            if (e.originalEvent.shiftKey) {
-                if (!currentArea) {
-                    currentArea = { start: e.latlng };
-                } else {
-                    const bounds = L.latLngBounds(currentArea.start, e.latlng);
-                    addArea(bounds);
-                    currentArea = null;
-                }
-            }
-        });
-
-        function addArea(bounds) {
-            // Remove overlapping areas
-            areas = areas.filter(area => !bounds.intersects(area.rectangle.getBounds()));
-            areas.forEach(area => map.removeLayer(area.rectangle));
-
-            const rectangle = L.rectangle(bounds, {
-                color: '#808080',
-                weight: 2,
-                dashArray: '5, 5',
-                fillOpacity: 0
-            }).addTo(map);
-            areas.push({ rectangle, bounds });
-            updateStats();
-        }
-
-        function updateFlightPaths() {
-            fetch('/flight_paths')
-                .then(response => response.json())
-                .then(data => {
-                    const activeFlightIds = new Set(data.map(f => f.flight_id));
-                    // Remove stale flights
-                    Object.keys(flightLines).forEach(id => {
-                        if (!activeFlightIds.has(id)) {
-                            flightLayer.removeLayer(flightLines[id]);
-                            delete flightLines[id];
-                        }
-                    });
-                    // Update or add flights
-                    data.forEach(flight => {
-                        const coords = flight.points.map(p => [p[0], p[1]]);
-                        if (flightLines[flight.flight_id]) {
-                            flightLayer.removeLayer(flightLines[flight.flight_id]);
-                        }
-                        const color = flight.classification === 'survey' ? '#ff0000' :
-                            flight.classification === 'a_to_b' ? '#00ff00' : '#808080';
-                        if (coords.length > 1) {
-                            flightLines[flight.flight_id] = L.polyline(coords, { color: color, weight: 4 });
-                            flightLines[flight.flight_id].bindPopup(`Flight: ${flight.flight_id}<br>Class: ${flight.classification || 'N/A'} (${flight.classification_source || 'N/A'})`);
-                            flightLines[flight.flight_id].addTo(flightLayer);
-                        } else {
-                            flightLines[flight.flight_id] = L.marker(coords[0], { color: color });
-                            flightLines[flight.flight_id].bindPopup(`Flight: ${flight.flight_id}<br>Class: ${flight.classification || 'N/A'} (${flight.classification_source || 'N/A'})`);
-                            flightLines[flight.flight_id].addTo(flightLayer);
-                        }
-                    });
-                    updateFlightList();
-                    updateStats();
-                    // Check if retrain is viable
-                    fetch('/flight_paths').then(r => r.json()).then(data => {
-                        const classCounts = data.reduce((acc, f) => {
-                            acc[f.classification] = (acc[f.classification] || 0) + 1;
-                            return acc;
-                        }, {});
-                        canRetrain = Object.keys(classCounts).length > 1 && data.length >= 10;
-                        document.getElementById('retrain-btn').disabled = !canRetrain;
-                    });
-                })
-                .catch(error => console.error('Error fetching paths:', error));
-        }
-
-        function updateFlightList() {
-            const list = document.getElementById('flight-list-content');
-            list.innerHTML = '';
-            Object.keys(flightLines).forEach(id => {
-                const flight = flightLines[id];
-                const points = flight.getLatLngs ? flight.getLatLngs().length : 1;
-                const popupContent = flight.options.popupContent || '';
-                const currentClass = popupContent.match(/Class: (.*?)(?:\s\(|$)/)?.[1] || 'N/A';
-                const source = popupContent.match(/\((.*?)\)/)?.[1] || 'N/A';
-                const div = document.createElement('div');
-                div.innerHTML = `
-                    ${id} - Points: ${points} - 
-                    <select onchange="updateClassification('${id}', this.value)">
-                        <option value="a_to_b" ${currentClass === 'a_to_b' ? 'selected' : ''}>A-to-B</option>
-                        <option value="survey" ${currentClass === 'survey' ? 'selected' : ''}>Survey</option>
-                        <option value="other" ${currentClass === 'other' ? 'selected' : ''}>Other</option>
-                    </select> (${source})
-                `;
-                list.appendChild(div);
-            });
-        }
-
-        function updateStats() {
-            document.getElementById('flight-count').innerText = Object.keys(flightLines).length;
-            document.getElementById('area-count').innerText = areas.length;
-        }
-
-        function updateClassification(flightId, classification) {
-            fetch('/update_classification', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ flight_id: flightId, classification: classification })
-            })
-                .then(response => response.json())
-                .then(data => {
-                    if (data.error) {
-                        console.error(data.error);
-                    } else {
-                        document.getElementById('log').innerText += `${data.message}\n`;
-                    }
-                })
-                .catch(error => console.error('Error:', error));
-        }
-
-        function retrainModel() {
-            if (!canRetrain) return;
-            fetch('/retrain_model', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({})
-            })
-                .then(response => response.json())
-                .then(data => {
-                    if (data.error) {
-                        console.error(data.error);
-                        document.getElementById('log').innerText += `Error: ${data.error}\n`;
-                    } else {
-                        document.getElementById('log').innerText += `${data.message}\n`;
-                    }
-                })
-                .catch(error => console.error('Error:', error));
-        }
-
-        function startMonitoring() {
-            if (areas.length === 0) {
-                alert("Please shift-click on the map to define at least one monitoring area!");
-                return;
-            }
-            const frequency = document.getElementById('frequency').value;
-            areas.forEach(area => {
-                const bounds = area.bounds;
-                fetch('/start_monitoring', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        lamin: bounds.getSouth(),
-                        lamax: bounds.getNorth(),
-                        lomin: bounds.getWest(),
-                        lomax: bounds.getEast(),
-                        frequency: frequency
-                    })
-                })
-                    .then(response => response.json())
-                    .then(data => {
-                        if (data.error) {
-                            console.error(data.error);
-                        } else {
-                            document.getElementById('log').innerText += 'Monitoring started for area ' + data.area_id + '\n';
-                        }
-                    })
-                    .catch(error => console.error('Error:', error));
-            });
-        }
-
-        updateFlightPaths();
-        setInterval(updateFlightPaths, 10000);
     </script>
 </body>
 

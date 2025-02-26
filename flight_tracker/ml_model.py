@@ -1,119 +1,78 @@
-import pandas as pd
-import numpy as np
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score
-import joblib
+import pickle
 import os
-import json
-from flight_tracker import logger
+from sklearn.ensemble import RandomForestClassifier
+from flight_tracker.utils import logger
+from flight_tracker.models import db, FlightPath
 
-MODEL_PATH = '/data/flight_classifier.pkl'
-DATA_PATH = '/data/flight_training_data.csv'
-
-def extract_features(points):
-    """Extract features from flight points for ML."""
-    if len(points) < 2:
-        return None
-    
-    total_distance = 0
-    direction_changes = 0
-    prev_angle = None
-    time_delta = points[-1][2] - points[0][2] if points[-1][2] and points[0][2] else 1
-    
-    for i in range(len(points) - 1):
-        lat1, lon1 = points[i][0], points[i][1]
-        lat2, lon2 = points[i + 1][0], points[i + 1][1]
-        distance = np.sqrt((lat2 - lat1)**2 + (lon2 - lon1)**2)
-        total_distance += distance
-
-        delta_lon = np.radians(lon2 - lon1)
-        lat1, lat2 = np.radians(lat1), np.radians(lat2)
-        y = np.sin(delta_lon) * np.cos(lat2)
-        x = np.cos(lat1) * np.sin(lat2) - np.sin(lat1) * np.cos(lat2) * np.cos(delta_lon)
-        angle = np.degrees(np.atan2(y, x))
-
-        if prev_angle is not None:
-            angle_diff = min(abs(angle - prev_angle), 360 - abs(angle - prev_angle))
-            if angle_diff > 30:
-                direction_changes += 1
-        prev_angle = angle
-
-    avg_speed = total_distance / (time_delta / 3600) if time_delta > 0 else 0
-    point_density = len(points) / total_distance if total_distance > 0 else 0
-    
-    return {
-        'total_distance': total_distance,
-        'direction_changes': direction_changes,
-        'avg_speed': avg_speed,
-        'point_density': point_density
-    }
-
-def train_model():
-    if not os.path.exists(DATA_PATH):
-        logger.warning("No training data available at {}".format(DATA_PATH))
-        return False
-
-    try:
-        df = pd.read_csv(DATA_PATH, header=None, names=['flight_id', 'latitudes', 'longitudes', 'label'], quotechar='"')
-    except pd.errors.ParserError as e:
-        logger.error(f"Failed to parse CSV: {e}")
-        df = pd.read_csv(DATA_PATH, header=None, names=['flight_id', 'latitudes', 'longitudes', 'label'], 
-                         quotechar='"', engine='python', on_bad_lines='skip')
-        logger.warning("Skipped malformed lines in CSV")
-
-    def parse_json_safe(x):
-        try:
-            return json.loads(x)
-        except (json.JSONDecodeError, TypeError):
-            logger.debug(f"Failed to parse JSON: {x}")
-            return []
-
-    df['latitudes'] = df['latitudes'].apply(parse_json_safe)
-    df['longitudes'] = df['longitudes'].apply(parse_json_safe)
-    df['points'] = df.apply(lambda row: list(zip(row['latitudes'], row['longitudes'], [0]*len(row['latitudes']))), axis=1)
-
-    features = df['points'].apply(extract_features)
-    mask = features.notna()
-    X = pd.DataFrame(features[mask].tolist())
-    y = df['label'][mask]
-
-    if len(X) < 10:
-        logger.warning("Insufficient data for training (<10 samples)")
-        return False
-
-    # Log class distribution
-    class_counts = y.value_counts().to_dict()
-    logger.info(f"Training data distribution: {class_counts}")
-
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-    model = RandomForestClassifier(n_estimators=100, random_state=42)
-    model.fit(X_train, y_train)
-
-    y_pred = model.predict(X_test)
-    accuracy = accuracy_score(y_test, y_pred)
-    logger.info(f"Model trained with accuracy: {accuracy:.2f}")
-
-    joblib.dump(model, MODEL_PATH)
-    return True
+MODEL_PATH = '/data/flight_model.pkl'
 
 def load_model():
-    """Load the trained model."""
+    """Load the saved model from disk."""
     if os.path.exists(MODEL_PATH):
-        return joblib.load(MODEL_PATH)
+        try:
+            with open(MODEL_PATH, 'rb') as f:
+                model = pickle.load(f)
+                logger.info("Model loaded from disk")
+                return model
+        except Exception as e:
+            logger.error(f"Failed to load model: {e}")
+            return None
+    logger.info("No saved model found, returning None")
     return None
 
-def predict_classification(points):
-    """Predict classification using the trained model."""
-    model = load_model()
-    if model is None:
-        logger.debug("No trained model available for prediction")
-        return None
+def save_model(model):
+    """Save the model to disk."""
+    try:
+        with open(MODEL_PATH, 'wb') as f:
+            pickle.dump(model, f)
+        logger.info("Model saved to disk")
+    except Exception as e:
+        logger.error(f"Failed to save model: {e}")
 
-    features = extract_features(points)
-    if features is None:
-        return None
+def train_model():
+    """Train the model using manual classifications from the database."""
+    # Filter for manually classified flights with valid classifications
+    flights = FlightPath.query.filter_by(auto_classified=False).filter(FlightPath.classification.isnot(None)).all()
+    if len(flights) < 10:
+        logger.warning(f"Insufficient manually classified flights to train model: {len(flights)} found")
+        return False
 
-    X = pd.DataFrame([features])
-    prediction = model.predict(X)[0]
-    return prediction
+    X = []
+    y = []
+    for flight in flights:
+        points = flight.points_list
+        if len(points) < 2:
+            continue
+        altitudes = [p[3] for p in points if p[3] != -1]
+        velocities = [p[4] for p in points if p[4] != -1]
+        lat_lons = [(p[0], p[1]) for p in points]
+        turns = 0
+        if len(lat_lons) > 2:
+            for i in range(len(lat_lons) - 2):
+                v1 = (lat_lons[i+1][0] - lat_lons[i][0], lat_lons[i+1][1] - lat_lons[i][1])
+                v2 = (lat_lons[i+2][0] - lat_lons[i+1][0], lat_lons[i+2][1] - lat_lons[i+1][1])
+                dot = v1[0] * v2[0] + v1[1] * v2[1]
+                mag1 = (v1[0]**2 + v1[1]**2)**0.5
+                mag2 = (v2[0]**2 + v2[1]**2)**0.5
+                if mag1 * mag2 > 0:
+                    cos_angle = dot / (mag1 * mag2)
+                    if cos_angle < 0.7:
+                        turns += 1
+        features = [
+            sum(altitudes) / len(altitudes) if altitudes else -1,
+            sum(velocities) / len(velocities) if velocities else -1,
+            turns / len(points) if points else 0
+        ]
+        X.append(features)
+        y.append(flight.classification)
+
+    if len(X) < 2 or len(set(y)) < 2:
+        logger.warning(f"Insufficient data variety to train model: {len(X)} samples, {len(set(y))} unique classes")
+        return False
+
+    model = RandomForestClassifier(n_estimators=100, random_state=42)
+    if model.fit(X, y):
+        save_model(model)
+        logger.info("Model trained successfully with %d samples and %d classes", len(X), len(set(y)))
+        return True
+    return False
