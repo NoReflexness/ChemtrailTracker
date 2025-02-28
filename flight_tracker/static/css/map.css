@@ -1,0 +1,32 @@
+.map-container {
+    flex: 2;
+    background: #252525;
+    border-radius: 10px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+    position: relative;
+    overflow: hidden;
+}
+
+#map {
+    height: 100%;
+    width: 100%;
+    border-radius: 10px;
+}
+
+.legend {
+    position: absolute;
+    top: 10px;
+    right: 10px;
+    background: rgba(45, 45, 45, 0.9);
+    padding: 5px 10px;
+    border-radius: 5px;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+    color: #e0e0e0;
+    z-index: 1000;
+    /* Ensure it stays above map layers */
+}
+
+.legend div {
+    margin: 3px 0;
+    font-size: 12px;
+}

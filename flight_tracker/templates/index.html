@@ -3,10 +3,18 @@
 
 <head>
     <title>Flight Tracker Dashboard</title>
-    <link rel="stylesheet" href="/static/style.css">
+    <link rel="stylesheet" href="/static/css/base.css">
+    <link rel="stylesheet" href="/static/css/top-bar.css">
+    <link rel="stylesheet" href="/static/css/map.css">
+    <link rel="stylesheet" href="/static/css/controls.css">
+    <link rel="stylesheet" href="/static/css/flight-list.css">
+    <link rel="stylesheet" href="/static/css/log.css">
     <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
     <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
     <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.4/css/all.min.css"
+        integrity="sha512-1ycn6IcaQQ40/MKBW2W4Rhis/DbILU74C1vSrLJxCq57o941Ym01SwNsOMqvEBFlcgUa6xLiPY/NS5R+E6ztJQ=="
+        crossorigin="anonymous" referrerpolicy="no-referrer" />
 </head>
 
 <body>
@@ -21,7 +29,7 @@
         <div class="main-content">
             <div class="map-container">
                 <div id="map"></div>
-                <div class="legend">
+                <div class="legend" id="map-legend">
                     <div><span style="color: #808080;">⋯</span> Disabled Area</div>
                     <div><span style="color: #006400;">⋯</span> Monitored Area</div>
                     <div><span style="color: #00ff00;">■</span> Commercial</div>
@@ -33,24 +41,31 @@
             <aside class="sidebar">
                 <div class="controls">
                     <h2>Controls</h2>
-                    <select id="frequency">
-                        <option value="30s">30s</option>
-                        <option value="1m">1m</option>
-                        <option value="5m">5m</option>
-                    </select>
-                    <button id="monitor-btn" onclick="toggleMonitoring()">Start Monitoring</button>
-                    <button id="delete-btn" onclick="deleteArea()" disabled>Delete Area</button>
-                    <button id="retrain-btn" onclick="retrainModel()" disabled>Retrain Model</button>
+                    <div class="control-row">
+                        <select id="frequency" title="Set refresh frequency">
+                            <option value="30s">30s</option>
+                            <option value="1m">1m</option>
+                            <option value="5m">5m</option>
+                        </select>
+                        <button id="monitor-btn" title="Toggle monitoring"><i class="fas fa-play"></i></button>
+                        <button id="delete-btn" title="Delete selected area" disabled><i
+                                class="fas fa-trash"></i></button>
+                        <button id="retrain-btn" title="Retrain ML model" disabled><i
+                                class="fas fa-sync-alt"></i></button>
+                    </div>
                     <h3>Show Paths</h3>
-                    <select id="path-classes" multiple size="4" onchange="updateFlightPaths()">
-                        <option value="commercial" selected>Commercial</option>
-                        <option value="survey">Survey</option>
-                        <option value="agriculture">Agriculture</option>
-                        <option value="cloud seeding">Cloud Seeding</option>
-                    </select>
+                    <div class="path-checkboxes">
+                        <label><input type="checkbox" id="show-commercial" onchange="updatePathsAndList()">
+                            Commercial</label>
+                        <label><input type="checkbox" id="show-survey" onchange="updatePathsAndList()"> Survey</label>
+                        <label><input type="checkbox" id="show-agriculture" onchange="updatePathsAndList()">
+                            Agriculture</label>
+                        <label><input type="checkbox" id="show-cloud-seeding" onchange="updatePathsAndList()"> Cloud
+                            Seeding</label>
+                    </div>
                     <div class="add-class">
                         <input type="text" id="new-class" placeholder="New classification">
-                        <button onclick="addClassification()">Add</button>
+                        <button id="add-class-btn" title="Add new classification"><i class="fas fa-plus"></i></button>
                     </div>
                 </div>
                 <div class="flight-list">
@@ -63,7 +78,7 @@
                         <option value="agriculture">Agriculture</option>
                         <option value="cloud seeding">Cloud Seeding</option>
                     </select>
-                    <div id="flight-list-content"></div>
+                    <div id="flight-list-content" class="flight-list-scroll"></div>
                 </div>
             </aside>
         </div>
@@ -76,6 +91,7 @@
     <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
     <script src="/static/js/simplify.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.5.1/socket.io.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/js-cookie@3.0.5/dist/js.cookie.min.js"></script>
     <script src="/static/js/utils.js"></script>
     <script src="/static/js/map_init.js"></script>
     <script src="/static/js/area_manager.js"></script>
@@ -86,20 +102,56 @@
         function addClassification() {
             const input = document.getElementById('new-class');
             const newClass = input.value.trim();
-            if (newClass && !Array.from(document.getElementById('path-classes').options).some(opt => opt.value === newClass)) {
-                const option = new Option(newClass, newClass);
-                document.getElementById('path-classes').add(option);
+            if (newClass && !Array.from(document.querySelectorAll('.path-checkboxes input')).some(cb => cb.id === `show-${newClass}`)) {
+                const checkbox = document.createElement('label');
+                checkbox.innerHTML = `<input type="checkbox" id="show-${newClass}" onchange="updatePathsAndList()"> ${newClass}`;
+                document.querySelector('.path-checkboxes').appendChild(checkbox);
                 document.getElementById('class-filter').add(new Option(newClass, newClass));
+                Cookies.set(`show-${newClass}`, 'false');
                 input.value = '';
-                updateFlightPaths();
+                updatePathsAndList();
             }
+        }
+
+        function updatePathsAndList() {
+            updateFlightPaths();
+            filterFlights();
+            document.querySelectorAll('.path-checkboxes input[type="checkbox"]').forEach(cb => {
+                Cookies.set(cb.id, cb.checked, { expires: 365 });
+            });
         }
 
         document.addEventListener('DOMContentLoaded', () => {
             initMap();
             setupSocketEvents();
-            updateFlightPaths();
+            const frequency = Cookies.get('frequency') || '30s';
+            document.getElementById('frequency').value = frequency;
+            ['commercial', 'survey', 'agriculture', 'cloud-seeding'].forEach(cls => {
+                const checkbox = document.getElementById(`show-${cls}`);
+                if (checkbox) checkbox.checked = Cookies.get(`show-${cls}`) === 'true';
+            });
+            updatePathsAndList();
             setInterval(updateFlightPaths, 10000);
+
+            document.getElementById('frequency').addEventListener('change', (e) => {
+                Cookies.set('frequency', e.target.value, { expires: 365 });
+            });
+
+            map.on('click', (e) => {
+                const clickedOnFlight = Object.values(flightLines).some(fd =>
+                    (fd.marker && fd.marker.getLatLng().equals(e.latlng)) ||
+                    (fd.line && fd.line.getBounds().contains(e.latlng))
+                );
+                if (!clickedOnFlight && !areas.some(a => a.rectangle.getBounds().contains(e.latlng))) {
+                    deselectFlight();
+                }
+            });
+
+            // Bind button events
+            document.getElementById('monitor-btn').addEventListener('click', toggleMonitoring);
+            document.getElementById('delete-btn').addEventListener('click', deleteArea);
+            document.getElementById('retrain-btn').addEventListener('click', retrainModel);
+            document.getElementById('add-class-btn').addEventListener('click', addClassification);
         });
     </script>
 </body>

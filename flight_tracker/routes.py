@@ -5,6 +5,21 @@ from flight_tracker.monitoring import start_monitoring_thread
 from flight_tracker.ml_model import train_model
 
 def register_routes(app, socketio):
+    @app.route('/add_area', methods=['POST'])
+    def add_area():
+        data = request.get_json()
+        area = MonitoredArea(
+            lamin=data['lamin'],
+            lamax=data['lamax'],
+            lomin=data['lomin'],
+            lomax=data['lomax'],
+            frequency=data['frequency'],
+            is_monitoring=False
+        )
+        db.session.add(area)
+        db.session.commit()
+        return jsonify({'message': f'Area {area.id} added', 'area_id': area.id})
+    
     @app.route('/')
     def index():
         return render_template('index.html')

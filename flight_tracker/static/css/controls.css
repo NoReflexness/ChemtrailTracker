@@ -1,0 +1,90 @@
+.controls {
+    background: #2d2d2d;
+    padding: 15px;
+    border-radius: 10px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+}
+
+.controls h2,
+.controls h3 {
+    margin: 0 0 10px;
+    font-size: 18px;
+    color: #b0b0b0;
+}
+
+.controls h3 {
+    font-size: 16px;
+    margin: 10px 0 5px;
+}
+
+.control-row {
+    display: flex;
+    gap: 10px;
+    margin-bottom: 10px;
+}
+
+.control-row select,
+.control-row button {
+    padding: 8px;
+    margin: 0;
+    border: 1px solid #555;
+    border-radius: 5px;
+    background: #3c3c3c;
+    color: #e0e0e0;
+    flex: 1;
+    text-align: center;
+}
+
+.control-row button {
+    background: #1a73e8;
+    border: none;
+    cursor: pointer;
+    font-size: 16px;
+}
+
+.control-row button:disabled {
+    background: #555;
+    cursor: not-allowed;
+}
+
+.control-row button:hover:not(:disabled) {
+    background: #1557b0;
+}
+
+.path-checkboxes label {
+    display: block;
+    margin: 5px 0;
+    color: #e0e0e0;
+}
+
+.path-checkboxes input[type="checkbox"] {
+    margin-right: 5px;
+}
+
+.add-class {
+    display: flex;
+    gap: 5px;
+    margin-top: 5px;
+}
+
+.add-class input[type="text"] {
+    flex: 1;
+    padding: 8px;
+    border: 1px solid #555;
+    border-radius: 5px;
+    background: #3c3c3c;
+    color: #e0e0e0;
+}
+
+.add-class button {
+    padding: 8px;
+    background: #1a73e8;
+    border: none;
+    border-radius: 5px;
+    color: #fff;
+    cursor: pointer;
+}
+
+.add-class button:hover {
+    background: #1557b0;
+}

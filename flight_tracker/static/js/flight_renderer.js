@@ -17,22 +17,30 @@ function calculateBearing(lat1, lon1, lat2, lon2) {
 }
 
 function shouldRenderPath(flight) {
-    const showClasses = Array.from(document.getElementById('path-classes').selectedOptions).map(option => option.value);
-    return flight.flight_id === selectedFlightId || // Always show selected flight's path
-        showClasses.includes(flight.classification || 'N/A');
+    const checkbox = document.getElementById(`show-${flight.classification || 'N/A'}`);
+    return flight.flight_id === selectedFlightId || (checkbox && checkbox.checked);
 }
 
 function renderFlightPath(flight) {
+    if (!flight || !flight.flight_id) {
+        console.warn('Invalid flight data, skipping render');
+        return;
+    }
+
     console.log('Rendering flight:', flight);
     const sortedPoints = flight.points.slice().sort((a, b) => a[2] - b[2]);
     let coords;
-    if (typeof simplify !== 'undefined') {
-        const simplifiedPoints = simplify(sortedPoints.map(p => ({ x: p[1], y: p[0], t: p[2], alt: p[3], vel: p[4] })), 0.01, true);
+    const isSelected = flight.flight_id === selectedFlightId;
+    const totalPaths = Object.keys(flightLines).length;
+    const useFullPoints = isSelected || totalPaths < 200;
+
+    if (typeof simplify !== 'undefined' && !useFullPoints) {
+        const simplifiedPoints = simplify(sortedPoints.map(p => ({ x: p[1], y: p[0], t: p[2], alt: p[3], vel: p[4] })), 0.1, true);
         coords = simplifiedPoints.map(p => [p.y, p.x]);
         console.log('Coordinates (simplified):', coords);
     } else {
-        coords = sortedPoints.map(p => [p[0], p[1]]);
-        console.warn('Simplify-js not loaded, using unsimplified coordinates:', coords);
+        coords = sortedPoints.map(p => [p[0], p[1]]); // Use full points for selected or < 200 paths
+        console.log('Coordinates (full):', coords);
     }
 
     const flightData = flightLines[flight.flight_id] || {};
@@ -48,8 +56,7 @@ function renderFlightPath(flight) {
         flight.classification === 'survey' ? '#ff0000' :
             flight.classification === 'agriculture' ? '#FFA500' :
                 flight.classification === 'cloud seeding' ? '#0000FF' : '#808080';
-    const isSelected = flight.flight_id === selectedFlightId;
-    const opacity = selectedFlightId ? (isSelected ? 1 : 0.1) : 0.8;
+    const opacity = isSelected ? 1 : (selectedFlightId ? 0.1 : 0.6);
     let rotation = 0;
 
     if (coords.length >= 1) {
@@ -61,45 +68,48 @@ function renderFlightPath(flight) {
         const duration = flight.duration === 0 ? 'N/A' : `${Math.round(flight.duration / 60)} min`;
         const popupContent = `Flight: ${flight.flight_id}<br>Class: ${flight.classification || 'N/A'} (${flight.classification_source || 'N/A'})<br>Altitude: ${altitude}<br>Velocity: ${velocity}<br>Avg Altitude: ${avgAltitude}<br>Avg Velocity: ${avgVelocity}<br>Duration: ${duration}`;
 
-        if (coords.length > 1 && shouldRenderPath(flight)) {
+        if (coords.length > 1) {
             const validCoords = coords.filter(([lat, lon]) => lat !== null && lon !== null && !isNaN(lat) && !isNaN(lon));
-            if (validCoords.length > 1) {
-                try {
-                    if (flightData.line) {
-                        flightData.line.setLatLngs(validCoords);
-                    } else {
-                        flightData.line = L.polyline(validCoords, { color: color, weight: 4, opacity: opacity });
-                        flightData.line.addTo(flightLayer);
-                    }
-                    flightData.line.bindPopup(popupContent);
-                    flightData.line.setStyle({ opacity: opacity });
-                    console.log('Updated/Added polyline for:', flight.flight_id);
-                } catch (e) {
-                    console.error(`Failed to render polyline for ${flight.flight_id}:`, e);
-                    delete flightData.line;
-                }
-
-                const lastPoints = validCoords.slice(-3);
-                if (lastPoints.length >= 2) {
-                    const [lat2, lon2] = lastPoints[lastPoints.length - 1];
-                    const [lat1, lon1] = lastPoints[lastPoints.length - 2];
-                    rotation = calculateBearing(lat1, lon1, lat2, lon2) - 45;
-                    flightData.lastRotation = rotation;
-                    console.log('Calculated rotation:', rotation);
-                } else {
-                    rotation = flightData.lastRotation || 0;
-                }
+            const lastPoints = validCoords.slice(-3);
+            if (lastPoints.length >= 2) {
+                const [lat2, lon2] = lastPoints[lastPoints.length - 1];
+                const [lat1, lon1] = lastPoints[lastPoints.length - 2];
+                rotation = calculateBearing(lat1, lon1, lat2, lon2) - 45;
+                flightData.lastRotation = rotation;
+                console.log('Calculated rotation:', rotation);
             } else {
-                console.warn(`Insufficient valid coordinates for polyline in ${flight.flight_id}:`, validCoords);
-                if (flightData.line) {
-                    flightLayer.removeLayer(flightData.line);
-                    delete flightData.line;
-                }
+                rotation = flightData.lastRotation || 0;
             }
-        } else if (flightData.line) {
-            flightLayer.removeLayer(flightData.line);
-            delete flightData.line;
-            console.log(`Removed polyline for ${flight.flight_id} (not selected or category deselected)`);
+
+            if (shouldRenderPath(flight)) {
+                if (validCoords.length > 1) {
+                    try {
+                        if (flightData.line) {
+                            flightData.line.setLatLngs(validCoords);
+                        } else {
+                            flightData.line = L.polyline(validCoords, { color: color, weight: 4, opacity: opacity });
+                            flightData.line.addTo(flightLayer);
+                            flightData.line.on('dblclick', () => selectFlight(flight.flight_id));
+                        }
+                        flightData.line.bindPopup(popupContent);
+                        flightData.line.setStyle({ opacity: opacity });
+                        console.log('Updated/Added polyline for:', flight.flight_id);
+                    } catch (e) {
+                        console.error(`Failed to render polyline for ${flight.flight_id}:`, e);
+                        delete flightData.line;
+                    }
+                } else {
+                    console.warn(`Insufficient valid coordinates for polyline in ${flight.flight_id}:`, validCoords);
+                    if (flightData.line) {
+                        flightLayer.removeLayer(flightData.line);
+                        delete flightData.line;
+                    }
+                }
+            } else if (flightData.line) {
+                flightLayer.removeLayer(flightData.line);
+                delete flightData.line;
+                console.log(`Removed polyline for ${flight.flight_id} (not selected or category deselected)`);
+            }
         }
 
         const airplaneIcon = L.divIcon({
@@ -117,6 +127,7 @@ function renderFlightPath(flight) {
             flightData.marker = L.marker(coords[coords.length - 1], { icon: airplaneIcon })
                 .bindPopup(popupContent)
                 .addTo(flightLayer);
+            flightData.marker.on('dblclick', () => selectFlight(flight.flight_id));
             flightData.marker.setOpacity(opacity);
         }
         console.log('Updated/Added marker for:', flight.flight_id);
@@ -129,39 +140,68 @@ const debouncedRenderFlightPath = debounce(renderFlightPath, 100);
 window.debouncedRenderFlightPath = renderFlightPath;
 
 function selectFlight(flightId) {
+    if (!flightId || !flightLines[flightId]) {
+        console.warn(`Cannot select flight ${flightId}: not found in flightLines`);
+        return;
+    }
+
     selectedFlightId = flightId;
+    const selectedFlightData = flightLines[flightId];
+
+    // Immediately render the selected flight’s path with full points
+    renderFlightPath(selectedFlightData);
+
+    // Update opacity for all other flights
     Object.keys(flightLines).forEach(id => {
-        const flightData = flightLines[id];
-        const isSelected = id === flightId;
-        const opacity = isSelected ? 1 : 0.1;
-        if (flightData.line) {
-            flightData.line.setStyle({ opacity: opacity });
-        }
-        if (flightData.marker) {
-            flightData.marker.setOpacity(opacity);
+        if (id !== flightId) {
+            const flightData = flightLines[id];
+            const opacity = 0.1; // Dim unselected flights
+            if (flightData.line) {
+                if (shouldRenderPath(flightData) && id !== selectedFlightId) {
+                    flightData.line.setStyle({ opacity: opacity });
+                } else if (!shouldRenderPath(flightData)) {
+                    flightLayer.removeLayer(flightData.line);
+                    delete flightData.line;
+                }
+            }
+            if (flightData.marker) {
+                flightData.marker.setOpacity(opacity);
+            }
         }
     });
-    if (flightLines[flightId]) {
-        if (flightLines[flightId].line) {
-            map.fitBounds(flightLines[flightId].line.getBounds());
-        } else if (flightLines[flightId].marker) {
-            map.setView(flightLines[flightId].marker.getLatLng(), 10);
-        }
+
+    // Zoom to the selected flight without forcing a cluster redraw
+    if (selectedFlightData.line) {
+        map.fitBounds(selectedFlightData.line.getBounds(), { maxZoom: 15 });
+    } else if (selectedFlightData.marker) {
+        map.setView(selectedFlightData.marker.getLatLng(), Math.min(map.getZoom(), 15));
     }
-    updateFlightPaths(); // Refresh to ensure selected path is drawn
+
+    updateFlightList(); // Update list without fetch
 }
 
 function deselectFlight() {
     selectedFlightId = null;
+
+    // Update all flights immediately
     Object.keys(flightLines).forEach(id => {
         const flightData = flightLines[id];
-        const opacity = 0.8;
+        const opacity = 0.6; // All shown mode
+        const shouldRender = document.getElementById(`show-${flightData.classification || 'N/A'}`)?.checked;
         if (flightData.line) {
-            flightData.line.setStyle({ opacity: opacity });
+            if (shouldRender) {
+                flightData.line.setStyle({ opacity: opacity });
+            } else {
+                flightLayer.removeLayer(flightData.line);
+                delete flightData.line;
+            }
+        } else if (shouldRender) {
+            renderFlightPath(flightData); // Draw path if it should be visible
         }
         if (flightData.marker) {
             flightData.marker.setOpacity(opacity);
         }
     });
-    updateFlightPaths(); // Refresh to remove unselected paths
+
+    updateFlightList(); // Update list without fetch
 }

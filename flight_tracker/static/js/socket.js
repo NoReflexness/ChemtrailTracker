@@ -6,14 +6,12 @@ function setupSocketEvents() {
     });
 
     socket.on('flight_update', (flight) => {
-        console.log('Received flight_update:', flight);
         window.debouncedRenderFlightPath(flight); // Raw function
         updateFlightList();
         updateStats();
     });
 
     socket.on('flight_batch_update', (data) => {
-        console.log('Received flight_batch_update:', data);
         let allCoords = [];
         data.flights.forEach(flight => {
             console.log('Processing flight:', flight);

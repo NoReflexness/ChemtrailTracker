@@ -1,0 +1,22 @@
+.top-bar {
+    background: #2d2d2d;
+    padding: 15px 20px;
+    border-bottom: 1px solid #444;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
+    border-radius: 0 0 10px 10px;
+}
+
+.top-bar h1 {
+    margin: 0;
+    font-size: 24px;
+    color: #1a73e8;
+}
+
+.stats span {
+    margin-left: 20px;
+    font-weight: 500;
+    color: #b0b0b0;
+}

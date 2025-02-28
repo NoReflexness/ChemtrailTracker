@@ -1,0 +1,38 @@
+.log-container {
+    background: #2d2d2d;
+    padding: 15px;
+    border-top: 1px solid #444;
+    border-radius: 10px 10px 0 0;
+    box-shadow: 0 -2px 4px rgba(0, 0, 0, 0.3);
+}
+
+.log-container h2 {
+    margin: 0 0 10px;
+    font-size: 18px;
+    color: #b0b0b0;
+}
+
+#log {
+    max-height: 150px;
+    overflow-y: auto;
+    font-family: 'Courier New', monospace;
+    background: #333;
+    color: #e0e0e0;
+    padding: 10px;
+    border-radius: 5px;
+    scrollbar-width: thin;
+    scrollbar-color: #555 #333;
+}
+
+#log::-webkit-scrollbar {
+    width: 8px;
+}
+
+#log::-webkit-scrollbar-track {
+    background: #333;
+}
+
+#log::-webkit-scrollbar-thumb {
+    background: #555;
+    border-radius: 4px;
+}

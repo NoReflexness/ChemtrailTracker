@@ -41,11 +41,14 @@ def fetch_flight_data(area):
         response = requests.get(BASE_URL, params=params, auth=(USERNAME, PASSWORD))
         response.raise_for_status()
         states = response.json()
+        if not states or 'states' not in states or states['states'] is None:
+            logger.warning(f"Invalid API response for area {area.id}: {states}")
+            return None
         credits_used += cost
         logger.info(f"Fetched data for area {area.id}. Credits used: {credits_used}/{MAX_CREDITS}")
         return states
     except requests.RequestException as e:
-        logger.error(f"Failed to fetch data: {e}")
+        logger.error(f"Failed to fetch data for area {area.id}: {e}")
         return None
 
 def cleanup_old_flights():
@@ -55,14 +58,14 @@ def cleanup_old_flights():
     logger.info("Cleaned up old flights")
 
 def process_states(states, socketio):
-    if not states or 'states' not in states:
-        logger.warning("No states data to process")
+    if not states or 'states' not in states or states['states'] is None:
+        logger.warning(f"No valid states data to process: {states}")
         return
     
     timestamp = states['time']
     flight_updates = []
     new_flights = []
-    processed_flight_ids = set()  # Track processed IDs in this cycle
+    processed_flight_ids = set()
     existing_flights = {f.flight_id: f for f in FlightPath.query.all()}
     batch_size = 500
 
@@ -102,7 +105,7 @@ def process_states(states, socketio):
                 logger.debug(f"Updated flight {flight_id} with new point: {new_point}")
             else:
                 logger.debug(f"Duplicate point for {flight_id}, skipping update")
-        elif flight_id not in processed_flight_ids:  # Check against processed IDs in this cycle
+        elif flight_id not in processed_flight_ids:
             new_flight = FlightPath(flight_id=flight_id, points=[new_point], last_updated=timestamp)
             new_flight.update_stats()
             analyze_flight(new_flight)
@@ -116,7 +119,7 @@ def process_states(states, socketio):
                 'duration': new_flight.duration
             })
             new_flights.append(new_flight)
-            processed_flight_ids.add(flight_id)  # Add to processed set
+            processed_flight_ids.add(flight_id)
             logger.debug(f"Added new flight {flight_id}")
         else:
             logger.debug(f"Flight {flight_id} already processed in this cycle, skipping")
