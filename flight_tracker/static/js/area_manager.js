@@ -106,7 +106,7 @@ function deselectArea() {
 }
 
 function updateAreaStyle(area) {
-    const fillOpacity = (area === selectedArea) ? 0.05 : 0;
+    const fillOpacity = (area === selectedArea) ? 0.01 : 0;
     const fillColor = '#00ff00';
     console.log(`Updating style for area: ${JSON.stringify(area.bounds)}, selected: ${area === selectedArea}, fillOpacity: ${fillOpacity}`);
     area.rectangle.setStyle({

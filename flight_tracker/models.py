@@ -1,5 +1,6 @@
 from flask_sqlalchemy import SQLAlchemy
 import json
+from flight_tracker.utils import logger
 
 db = SQLAlchemy()
 
@@ -11,6 +12,7 @@ def init_db(app):
         db.create_all()
 
 class MonitoredArea(db.Model):
+    __tablename__ = 'monitored_area'  
     id = db.Column(db.Integer, primary_key=True)
     lamin = db.Column(db.Float, nullable=False)
     lamax = db.Column(db.Float, nullable=False)
@@ -20,8 +22,9 @@ class MonitoredArea(db.Model):
     is_monitoring = db.Column(db.Boolean, default=False)
 
 class FlightPath(db.Model):
+    __tablename__ = 'flight_path'
     flight_id = db.Column(db.String(20), primary_key=True)
-    points = db.Column(db.Text, nullable=True)  # JSON-encoded list of [lat, lon, timestamp, alt, vel]
+    points = db.Column(db.Text, nullable=True)  
     last_updated = db.Column(db.Integer, nullable=False)
     classification = db.Column(db.String(20))
     classification_source = db.Column(db.String(20))
@@ -37,8 +40,10 @@ class FlightPath(db.Model):
         self.update_stats()
 
     def update_stats(self):
-        if self.points:
+        try:
             points = json.loads(self.points) if isinstance(self.points, str) else self.points
+            if not isinstance(points, list):
+                raise ValueError("Points must be a list")
             normalized_points = []
             for p in points:
                 if not isinstance(p, list):
@@ -54,6 +59,12 @@ class FlightPath(db.Model):
             self.avg_altitude = sum(altitudes) / len(altitudes) if altitudes else -1
             self.avg_velocity = sum(velocities) / len(velocities) if velocities else -1
             self.duration = max(timestamps) - min(timestamps) if len(timestamps) > 1 else 0
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.error(f"Error updating stats for {self.flight_id}: {e}")
+            self.points = json.dumps([])
+            self.avg_altitude = -1
+            self.avg_velocity = -1
+            self.duration = 0
 
     @property
     def points_list(self):

@@ -1,6 +1,7 @@
+// flight_tracker/static/js/map_init.js
 const map = L.map('map', {
     zoomControl: false,
-    renderer: L.canvas() // Use canvas renderer for the map
+    renderer: L.canvas()
 }).setView([56.0, 11.0], 6);
 
 L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
@@ -10,7 +11,7 @@ L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
 const flightLayer = L.markerClusterGroup({
     maxClusterRadius: 50,
     disableClusteringAtZoom: 15,
-    chunkedLoading: true // Improve loading performance for many markers
+    chunkedLoading: true
 }).addTo(map);
 
 let hasZoomed = false;
@@ -31,4 +32,5 @@ function initMap() {
     map.on('mousemove', onMouseMove);
     map.on('mouseup', onMouseUp);
     map.on('click', onMapClick);
+    console.log('flightLayer added to map:', flightLayer._map !== null); // Debug
 }

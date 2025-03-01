@@ -1,25 +1,26 @@
+# flight_tracker/__init__.py
 from flask import Flask
 from flask_socketio import SocketIO
 from flight_tracker.utils import logger, setup_logging
 from flight_tracker.models import db, FlightPath
-from flight_tracker.monitoring import init_indexes
+from flight_tracker.monitoring import init_indexes, start_monitoring
 from flight_tracker.analysis import start_buffer_thread
 import json
 import os
 
 def create_app():
     app = Flask(__name__)
-    socketio = SocketIO(app, manage_session=False)  # Disable session management to avoid conflicts
+    socketio = SocketIO(app, manage_session=False)
 
     setup_logging(socketio)
 
     from flight_tracker.routes import register_routes
-    from flight_tracker.monitoring import start_monitoring
 
     uri = 'postgresql://user:password@postgres:5432/flight_tracker'
     logger.info(f"Using database URI: {uri}")
     app.config['SQLALCHEMY_DATABASE_URI'] = uri
     app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+    app.config['selected_classifications'] = set()
     db.init_app(app)
     
     with app.app_context():
@@ -68,11 +69,16 @@ def create_app():
     @socketio.on('connect')
     def handle_connect():
         logger.info("Client connected")
-        start_monitoring(app, socketio)
+        start_monitoring(app, socketio, app.config['selected_classifications'])
 
     @socketio.on('disconnect')
     def handle_disconnect(arg=None):
         logger.info("Client disconnected")
+
+    @socketio.on('update_classifications')
+    def handle_classifications(data):
+        app.config['selected_classifications'] = set(data['classifications'])
+        logger.info(f"Updated selected classifications: {app.config['selected_classifications']}")
 
     @socketio.on_error_default
     def handle_error(e):

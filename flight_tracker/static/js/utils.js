@@ -1,5 +1,7 @@
+// flight_tracker/static/js/utils.js
 let canRetrain = false;
 let updateTimeout = null;
+let totalFlights = 0;
 
 function debounce(func, wait) {
     let timeout;
@@ -15,57 +17,59 @@ function appendLog(message) {
     log.scrollTop = 0;
 }
 
-function debounceUpdateFlightPaths() {
-    clearTimeout(updateTimeout);
-    updateTimeout = setTimeout(updateFlightPaths, 500);
-}
-
 function getSelectedClasses() {
     return Array.from(document.querySelectorAll('.path-checkboxes input[type="checkbox"]:checked'))
         .map(cb => cb.id.replace('show-', ''));
 }
 
 function updateFlightPaths() {
-    fetch('/flight_paths')
-        .then(response => response.json())
+    const selectedClasses = getSelectedClasses();
+    const url = selectedClasses.length > 0
+        ? `/flight_paths?${selectedClasses.map(cls => `classifications=${cls}`).join('&')}`
+        : '/flight_paths';
+    fetch(url)
+        .then(response => {
+            if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+            return response.json();
+        })
         .then(data => {
             console.log('Fetched flight paths:', data);
-            const activeFlightIds = new Set(data.map(f => f.flight_id));
-            Object.keys(flightLines).forEach(id => {
-                if (!activeFlightIds.has(id)) {
-                    if (flightLines[id].line) flightLayer.removeLayer(flightLines[id].line);
-                    if (flightLines[id].marker) flightLayer.removeLayer(flightLines[id].marker);
-                    delete flightLines[id];
-                }
-            });
-            data.forEach(flight => debouncedRenderFlightPath(flight));
-            updateFlightList();
-            updateStats();
-            fetch('/flight_paths').then(r => r.json()).then(data => {
-                const classCounts = data.reduce((acc, f) => {
-                    acc[f.classification] = (acc[f.classification] || 0) + 1;
-                    return acc;
-                }, {});
-                canRetrain = Object.keys(classCounts).length > 1 && data.length >= 10;
-                document.getElementById('retrain-btn').disabled = !canRetrain;
-            });
-            document.querySelectorAll('.path-checkboxes input[type="checkbox"]').forEach(cb => {
-                Cookies.set(cb.id, cb.checked, { expires: 365 });
-            });
+            updateFlightPathsFromData(data);
+            fetchTotalFlights(); // Fetch total separately
+            const classCounts = data.reduce((acc, f) => {
+                acc[f.classification || 'N/A'] = (acc[f.classification || 'N/A'] || 0) + 1;
+                return acc;
+            }, {});
+            canRetrain = Object.keys(classCounts).length > 1 && data.length >= 10;
+            document.getElementById('retrain-btn').disabled = !canRetrain;
         })
         .catch(error => console.error('Error fetching paths:', error));
+}
+
+function fetchTotalFlights() {
+    fetch('/flight_count')
+        .then(response => {
+            if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+            return response.json();
+        })
+        .then(data => {
+            totalFlights = data.count;
+            updateStats();
+            console.log(`Total flights updated: ${totalFlights}`);
+        })
+        .catch(error => console.error('Error fetching total flights:', error));
 }
 
 function updateFlightList() {
     const list = document.getElementById('flight-list-content');
     list.innerHTML = '';
-    console.log('Updating flight list with flightLines:', Object.keys(flightLines));
     const selectedClasses = getSelectedClasses();
+    let visibleFlightCount = 0;
 
     Object.keys(flightLines).forEach(id => {
         const flight = flightLines[id];
         const popupContent = flight.line?.getPopup()?.getContent() || flight.marker?.getPopup()?.getContent() || '';
-        const currentClass = popupContent.match(/Class: (.*?)(?:\s\(|$)/)?.[1] || 'N/A';
+        const currentClass = popupContent.match(/Class: (.*?)(?:\s|$)/)?.[1] || 'N/A';
         const source = popupContent.match(/\((.*?)\)/)?.[1] || 'N/A';
         const lastPoint = flight.points[flight.points.length - 1];
         const altitude = lastPoint[3] === -1 ? 'N/A' : `${lastPoint[3]} m`;
@@ -73,10 +77,13 @@ function updateFlightList() {
         const avgAltitude = flight.avg_altitude === -1 ? 'N/A' : `${Math.round(flight.avg_altitude)} m`;
         const avgVelocity = flight.avg_velocity === -1 ? 'N/A' : `${Math.round(flight.avg_velocity)} m/s`;
         const duration = flight.duration === 0 ? 'N/A' : `${Math.round(flight.duration / 60)} min`;
-        const heading = flight.line ? (flight.line.getLatLngs().length > 1 ? flight.lastRotation || 'N/A' : 'N/A') : 'N/A';
+        const heading = flight.lastRotation ? `${Math.round(flight.lastRotation)}°` : 'N/A';
 
-        // Show flight if its class is selected, no classes are selected, or it’s the selected flight
-        const shouldShow = selectedClasses.length === 0 || selectedClasses.includes(currentClass) || id === selectedFlightId;
+        const shouldShow = selectedClasses.length === 0 ||
+            selectedClasses.includes(currentClass) ||
+            id === selectedFlightId;
+        const willRender = shouldRenderPath(flight); // Sync with renderer
+
         if (shouldShow) {
             const div = document.createElement('div');
             if (id === selectedFlightId) {
@@ -91,7 +98,7 @@ function updateFlightList() {
                     <div class="flight-data">
                         <div><svg class="icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#e0e0e0" stroke-width="2"><path d="M12 2v20m10-10H2"/></svg><span>Alt: ${altitude}</span></div>
                         <div><svg class="icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#e0e0e0" stroke-width="2"><path d="M22 11h-8l-2-9L2 12l10 10 2-9h8z"/></svg><span>Vel: ${velocity}</span></div>
-                        <div><svg class="icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#e0e0e0" stroke-width="2"><path d="M12 2v10l8 4-8-14zm0 20v-6"/></svg><span>Heading: ${heading === 'N/A' ? 'N/A' : `${Math.round(heading)}°`}</span></div>
+                        <div><svg class="icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#e0e0e0" stroke-width="2"><path d="M12 2v10l8 4-8-14zm0 20v-6"/></svg><span>Heading: ${heading}</span></div>
                         <div><svg class="icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#e0e0e0" stroke-width="2"><path d="M12 2v20m10-10H2"/></svg><span>Avg Alt: ${avgAltitude}</span></div>
                         <div><svg class="icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#e0e0e0" stroke-width="2"><path d="M22 11h-8l-2-9L2 12l10 10 2-9h8z"/></svg><span>Avg Vel: ${avgVelocity}</span></div>
                         <div><svg class="icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#e0e0e0" stroke-width="2"><path d="M12 2v6m0 10v6m-6-12h12"/></svg><span>Duration: ${duration}</span></div>
@@ -117,32 +124,17 @@ function updateFlightList() {
             div.onclick = () => selectFlight(id);
             div.tabIndex = 0;
             list.appendChild(div);
+            if (willRender) visibleFlightCount++; // Only count if rendered
         }
     });
-    filterFlights();
-
-    list.addEventListener('keydown', (e) => {
-        const items = Array.from(list.children).filter(item => item.style.display !== 'none');
-        if (!items.length) return;
-        const focused = document.activeElement;
-        const index = items.indexOf(focused);
-
-        if (e.key === 'ArrowDown' && index < items.length - 1) {
-            e.preventDefault();
-            items[index + 1].focus();
-            selectFlight(items[index + 1].querySelector('span').textContent.split(' - ')[0]);
-        } else if (e.key === 'ArrowUp' && index > 0) {
-            e.preventDefault();
-            items[index - 1].focus();
-            selectFlight(items[index - 1].querySelector('span').textContent.split(' - ')[0]);
-        }
-    });
+    filterFlights(); // Will update visible count again
+    document.getElementById('filtered-flight-count').innerText = visibleFlightCount;
+    console.log(`Visible flights: ${visibleFlightCount}, Total flights: ${totalFlights}`);
 }
 
 function updateStats() {
-    document.getElementById('flight-count').innerText = Object.keys(flightLines).length;
+    document.getElementById('flight-count').innerText = totalFlights;
     document.getElementById('area-count').innerText = areas.filter(a => a.is_monitoring).length;
-    console.log('Total flights tracked:', flightLines.size);
 }
 
 function updateClassification(flightId, classification) {
@@ -157,7 +149,7 @@ function updateClassification(flightId, classification) {
                 console.error(data.error);
             } else {
                 appendLog(data.message);
-                debounceUpdateFlightPaths();
+                updateFlightPaths();
             }
         })
         .catch(error => console.error('Error:', error));
@@ -168,13 +160,24 @@ function filterFlights() {
     const classFilter = document.getElementById('class-filter').value;
     const selectedClasses = getSelectedClasses();
     const list = document.getElementById('flight-list-content');
+    let visibleFlightCount = 0;
+
     Array.from(list.children).forEach(div => {
         const text = div.textContent.toLowerCase();
         const classification = div.dataset.classification || 'N/A';
         const flightId = div.querySelector('span').textContent.split(' - ')[0];
+        const flight = flightLines[flightId];
         const matchesText = text.includes(textFilter);
         const matchesClass = !classFilter || classification === classFilter;
-        const matchesPathSelection = selectedClasses.length === 0 || selectedClasses.includes(classification) || flightId === selectedFlightId;
-        div.style.display = matchesText && matchesClass && matchesPathSelection ? '' : 'none';
+        const matchesPathSelection = selectedClasses.length === 0 ||
+            selectedClasses.includes(classification) ||
+            flightId === selectedFlightId;
+        const shouldShow = matchesText && matchesClass && matchesPathSelection;
+        const willRender = shouldRenderPath(flight); // Sync with renderer
+
+        div.style.display = shouldShow ? '' : 'none';
+        if (shouldShow && willRender) visibleFlightCount++;
     });
+
+    document.getElementById('filtered-flight-count').innerText = visibleFlightCount;
 }

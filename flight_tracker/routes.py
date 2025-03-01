@@ -1,3 +1,4 @@
+# flight_tracker/routes.py
 from flask import render_template, request, jsonify
 from flight_tracker.utils import logger
 from flight_tracker.models import db, MonitoredArea, FlightPath
@@ -19,7 +20,7 @@ def register_routes(app, socketio):
         db.session.add(area)
         db.session.commit()
         return jsonify({'message': f'Area {area.id} added', 'area_id': area.id})
-    
+
     @app.route('/')
     def index():
         return render_template('index.html')
@@ -39,7 +40,7 @@ def register_routes(app, socketio):
         area = MonitoredArea(lamin=lamin, lamax=lamax, lomin=lomin, lomax=lomax, frequency=frequency, is_monitoring=True)
         db.session.add(area)
         db.session.commit()
-        start_monitoring_thread(app, socketio, area)
+        start_monitoring_thread(app, socketio, area, app.config['selected_classifications'])
         logger.info(f"Started monitoring for area ID {area.id}")
         return jsonify({'message': 'Monitoring started', 'area_id': area.id}), 200
 
@@ -53,12 +54,13 @@ def register_routes(app, socketio):
 
         area = MonitoredArea.query.get(area_id)
         if area:
-            area.is_monitoring = False
-            db.session.commit()
-            logger.info(f"Stopped monitoring for area ID {area_id}")
+            if area.is_monitoring:
+                area.is_monitoring = False
+                db.session.commit()
+                logger.info(f"Stopped monitoring for area ID {area_id}")
             return jsonify({'message': 'Monitoring stopped', 'area_id': area_id}), 200
-        logger.warning(f"Area ID {area_id} not found for stop_monitoring")
-        return jsonify({'error': 'Area not found'}), 404
+        logger.warning(f"Area ID {area_id} not found for stop_monitoring, possibly already deleted")
+        return jsonify({'message': 'Monitoring stopped or area already deleted', 'area_id': area_id}), 200
 
     @app.route('/areas', methods=['GET'])
     def get_areas():
@@ -79,7 +81,18 @@ def register_routes(app, socketio):
 
     @app.route('/flight_paths', methods=['GET'])
     def get_flight_paths():
-        flights = FlightPath.query.all()
+        classifications = request.args.getlist('classifications')
+        query = FlightPath.query
+        if classifications:
+            if 'N/A' in classifications:
+                classifications.remove('N/A')
+                query = query.filter(
+                    (FlightPath.classification.in_(classifications)) | 
+                    (FlightPath.classification.is_(None))
+                )
+            else:
+                query = query.filter(FlightPath.classification.in_(classifications))
+        flights = query.all()
         flight_data = [
             {
                 'flight_id': flight.flight_id,
@@ -92,7 +105,29 @@ def register_routes(app, socketio):
             }
             for flight in flights
         ]
+        logger.debug(f"Returning {len(flight_data)} flights for classifications: {classifications}")
         return jsonify(flight_data)
+
+    @app.route('/flight_count', methods=['GET'])
+    def get_flight_count():
+        count = FlightPath.query.distinct(FlightPath.flight_id).count()
+        logger.debug(f"Total tracked flights: {count}")
+        return jsonify({'count': count})
+
+    @app.route('/flight_path/<flight_id>', methods=['GET'])
+    def get_flight_path(flight_id):
+        flight = FlightPath.query.get(flight_id)
+        if flight:
+            return jsonify({
+                'flight_id': flight.flight_id,
+                'points': flight.points_list,
+                'classification': flight.classification,
+                'classification_source': flight.classification_source,
+                'avg_altitude': flight.avg_altitude,
+                'avg_velocity': flight.avg_velocity,
+                'duration': flight.duration
+            })
+        return jsonify({'error': 'Flight not found'}), 404
 
     @app.route('/update_classification', methods=['POST'])
     def update_classification():
