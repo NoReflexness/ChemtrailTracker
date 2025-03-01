@@ -72,7 +72,7 @@ function addArea(bounds, isMonitoring, id, frequency) {
         { color: '#006400', weight: 2, dashArray: '5, 5', fillOpacity: 0 } :
         { color: '#808080', weight: 2, dashArray: '5, 5', fillOpacity: 0 };
     const rectangle = L.rectangle(bounds, style).addTo(map);
-    const area = { rectangle, bounds, isMonitoring, id, frequency };
+    const area = { rectangle, bounds, isMonitoring, id, frequency, name: null }; // Add name
     rectangle.on('click', (e) => {
         L.DomEvent.stopPropagation(e);
         console.log(`Area clicked, selecting: ${JSON.stringify(bounds)}`);
@@ -81,6 +81,7 @@ function addArea(bounds, isMonitoring, id, frequency) {
     areas.push(area);
     updateStats();
     updateMonitorButton();
+    updateAreaList(); // Update list when area added
 }
 
 function selectArea(area) {

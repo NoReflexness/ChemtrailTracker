@@ -1,20 +1,43 @@
 .controls {
     background: #2d2d2d;
-    padding: 15px;
+    padding: 10px;
     border-radius: 10px;
     box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
 }
 
-.controls h2,
-.controls h3 {
-    margin: 0 0 10px;
-    font-size: 18px;
-    color: #b0b0b0;
+.control-tabs {
+    display: flex;
+    gap: 2px;
+    margin-bottom: 10px;
 }
 
-.controls h3 {
+.tab-btn {
+    flex: 1;
+    background: #3c3c3c;
+    border: 1px solid #555;
+    border-radius: 5px;
+    padding: 8px;
+    color: #e0e0e0;
+    cursor: pointer;
+    text-align: center;
     font-size: 16px;
-    margin: 10px 0 5px;
+}
+
+.tab-btn:hover {
+    background: #555;
+}
+
+.tab-btn.active {
+    background: #1a73e8;
+    border-color: #1a73e8;
+}
+
+.tab-btn i {
+    color: #e0e0e0;
+}
+
+.tab-content {
+    margin-top: 10px;
 }
 
 .control-row {
@@ -87,4 +110,55 @@
 
 .add-class button:hover {
     background: #1557b0;
+}
+
+.area-list-scroll {
+    max-height: 150px;
+    overflow-y: auto;
+    scrollbar-width: thin;
+    scrollbar-color: #555 #333;
+    margin-bottom: 10px;
+}
+
+.area-list-scroll::-webkit-scrollbar {
+    width: 8px;
+}
+
+.area-list-scroll::-webkit-scrollbar-track {
+    background: #333;
+}
+
+.area-list-scroll::-webkit-scrollbar-thumb {
+    background: #555;
+    border-radius: 4px;
+}
+
+.area-item {
+    display: flex;
+    align-items: center;
+    padding: 5px;
+    color: #e0e0e0;
+    cursor: pointer;
+}
+
+.area-item:hover {
+    background-color: #444;
+}
+
+.area-item.selected {
+    background-color: #3c3c3c;
+}
+
+.area-name {
+    flex: 1;
+}
+
+.area-status {
+    width: 20px;
+    text-align: center;
+}
+
+#ml-stats p {
+    margin: 5px 0;
+    color: #e0e0e0;
 }

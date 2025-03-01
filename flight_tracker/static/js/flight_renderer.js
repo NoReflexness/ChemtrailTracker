@@ -18,25 +18,27 @@ function calculateBearing(lat1, lon1, lat2, lon2) {
 }
 
 function shouldRenderPath(flight) {
-    const checkbox = document.getElementById(`show-${flight.classification || 'N/A'}`);
-    return flight.flight_id === selectedFlightId || (checkbox && checkbox.checked);
+    const selectedClasses = getSelectedClasses();
+    const flightClass = flight.classification || 'N/A';
+    return selectedClasses.length === 0 ||
+        flight.flight_id === selectedFlightId ||
+        selectedClasses.includes(flightClass);
 }
 
 function renderFlightPath(flight) {
     if (!flight || !flight.flight_id || !flight.points) {
-        console.warn('Invalid flight data, skipping render:', flight);
         return;
     }
 
-    console.log(`Rendering flight ${flight.flight_id}: points=${flight.points.length}, classification=${flight.classification || 'N/A'}`);
     const sortedPoints = flight.points.slice().sort((a, b) => a[2] - b[2]);
     let coords;
     const isSelected = flight.flight_id === selectedFlightId;
     const totalPaths = Object.keys(flightLines).length;
     const useFullPoints = isSelected || totalPaths < 200;
+    const useBearing = totalPaths < 1000; // Disable bearing for >1000 markers
 
     if (typeof simplify !== 'undefined' && !useFullPoints) {
-        const simplifiedPoints = simplify(sortedPoints.map(p => ({ x: p[1], y: p[0], t: p[2], alt: p[3], vel: p[4] })), 0.1, true);
+        const simplifiedPoints = simplify(sortedPoints.map(p => ({ x: p[1], y: p[0], t: p[2], alt: p[3], vel: p[4] })), 0.01, true);
         coords = simplifiedPoints.map(p => [p.y, p.x]);
     } else {
         coords = sortedPoints.map(p => [p[0], p[1]]);
@@ -52,8 +54,6 @@ function renderFlightPath(flight) {
     flightData.duration = flight.duration;
 
     const willRender = shouldRenderPath(flight);
-    console.log(`Flight ${flight.flight_id}: shouldRender=${willRender}, coords=${coords.length}`);
-
     if (!willRender) {
         if (flightData.line) flightLayer.removeLayer(flightData.line);
         if (flightData.marker) flightLayer.removeLayer(flightData.marker);
@@ -62,22 +62,14 @@ function renderFlightPath(flight) {
         return;
     }
 
-    const color = {
-        'commercial': '#00ff00',
-        'survey': '#ff0000',
-        'agriculture': '#FFA500',
-        'cloud seeding': '#0000FF',
-        'crop dusting': '#FF00FF',
-        'rescue': '#FFFF00',
-        'chemtrail': '#800080',
-        'N/A': '#808080'
-    }[flightData.classification] || '#808080';
+    const cls = classifications.find(c => c.name === flightData.classification) || { color: '#808080' };
+    const color = cls.color;
     const opacity = isSelected ? 1 : (selectedFlightId ? 0.1 : 0.6);
 
     let patternStyle = { dashArray: null };
     if (isSelected) {
-        if (flightData.classification === 'cloud seeding') patternStyle.dashArray = '10, 5';
-        else if (flightData.classification === 'crop dusting') patternStyle.dashArray = '5, 10, 5';
+        if (flightData.classification === 'cloud_seeding') patternStyle.dashArray = '10, 5';
+        else if (flightData.classification === 'crop_dusting') patternStyle.dashArray = '5, 10, 5';
         else if (flightData.classification === 'rescue') patternStyle.dashArray = '15, 5';
     }
 
@@ -86,10 +78,10 @@ function renderFlightPath(flight) {
         const popupContent = `Flight: ${flight.flight_id}<br>Class: ${flightData.classification}<br>Altitude: ${lastPoint[3] === -1 ? 'N/A' : `${lastPoint[3]} m`}<br>Velocity: ${lastPoint[4] === -1 ? 'N/A' : `${lastPoint[4]} m/s`}<br>Avg Altitude: ${flight.avg_altitude === -1 ? 'N/A' : `${Math.round(flight.avg_altitude)} m`}<br>Avg Velocity: ${flight.avg_velocity === -1 ? 'N/A' : `${Math.round(flight.avg_velocity)} m/s`}<br>Duration: ${flight.duration === 0 ? 'N/A' : `${Math.round(flight.duration / 60)} min`}`;
 
         let rotation = 0;
-        if (coords.length > 1) {
+        if (coords.length > 1 && totalPaths < 500) { // Limit path rendering
             const validCoords = coords.filter(([lat, lon]) => lat !== null && lon !== null && !isNaN(lat) && !isNaN(lon));
             const lastPoints = validCoords.slice(-3);
-            if (lastPoints.length >= 2) {
+            if (lastPoints.length >= 2 && useBearing) {
                 const [lat2, lon2] = lastPoints[lastPoints.length - 1];
                 const [lat1, lon1] = lastPoints[lastPoints.length - 2];
                 rotation = calculateBearing(lat1, lon1, lat2, lon2) - 45;
@@ -102,16 +94,14 @@ function renderFlightPath(flight) {
                 try {
                     if (flightData.line) {
                         flightData.line.setLatLngs(validCoords);
-                        flightData.line.setStyle({ color, opacity, dashArray: patternStyle.dashArray });
+                        flightData.line.setStyle({ color, opacity, weight: 2, dashArray: patternStyle.dashArray });
                     } else {
-                        flightData.line = L.polyline(validCoords, { color, weight: 4, opacity, dashArray: patternStyle.dashArray })
+                        flightData.line = L.polyline(validCoords, { color, weight: 2, opacity, dashArray: patternStyle.dashArray })
                             .addTo(flightLayer)
                             .on('dblclick', () => selectFlight(flight.flight_id));
                     }
                     flightData.line.bindPopup(popupContent);
-                    console.log(`Flight ${flight.flight_id}: polyline rendered`);
                 } catch (e) {
-                    console.error(`Failed to render polyline for ${flight.flight_id}:`, e);
                     delete flightData.line;
                 }
             } else if (flightData.line) {
@@ -120,38 +110,57 @@ function renderFlightPath(flight) {
             }
         }
 
-        const airplaneIcon = L.divIcon({
-            html: `<div style="transform: rotate(${rotation}deg);">${airplaneSvg}</div>`,
-            className: 'airplane-icon',
-            iconSize: [20, 20],
-            iconAnchor: [10, 10]
-        });
-
         if (flightData.marker) {
             flightData.marker.setLatLng(coords[coords.length - 1]);
-            flightData.marker.setIcon(airplaneIcon);
-            flightData.marker.setOpacity(opacity);
+            if (useBearing) {
+                const airplaneIcon = L.divIcon({
+                    html: `<div style="transform: rotate(${rotation}deg);">${airplaneSvg}</div>`,
+                    className: 'airplane-icon',
+                    iconSize: [20, 20],
+                    iconAnchor: [10, 10]
+                });
+                flightData.marker.setIcon(airplaneIcon);
+            } else {
+                flightData.marker.setStyle({ radius: 5, fillColor: color, color: color, weight: 1, opacity: opacity, fillOpacity: opacity });
+            }
         } else {
             try {
-                flightData.marker = L.marker(coords[coords.length - 1], { icon: airplaneIcon })
-                    .bindPopup(popupContent)
-                    .addTo(flightLayer)
-                    .on('dblclick', () => selectFlight(flight.flight_id));
+                if (useBearing) {
+                    const airplaneIcon = L.divIcon({
+                        html: `<div style="transform: rotate(${rotation}deg);">${airplaneSvg}</div>`,
+                        className: 'airplane-icon',
+                        iconSize: [20, 20],
+                        iconAnchor: [10, 10]
+                    });
+                    flightData.marker = L.marker(coords[coords.length - 1], { icon: airplaneIcon })
+                        .bindPopup(popupContent)
+                        .addTo(flightLayer)
+                        .on('dblclick', () => selectFlight(flight.flight_id));
+                } else {
+                    flightData.marker = L.circleMarker(coords[coords.length - 1], {
+                        radius: 5,
+                        fillColor: color,
+                        color: color,
+                        weight: 1,
+                        opacity: opacity,
+                        fillOpacity: opacity
+                    })
+                        .bindPopup(popupContent)
+                        .addTo(flightLayer)
+                        .on('dblclick', () => selectFlight(flight.flight_id));
+                }
                 flightData.marker.setOpacity(opacity);
-                console.log(`Flight ${flight.flight_id}: marker rendered`);
             } catch (e) {
-                console.error(`Failed to render marker for ${flight.flight_id}:`, e);
                 delete flightData.marker;
             }
         }
     }
 }
 
-// Remove debounce for immediate rendering
 function renderFlightPathImmediate(flight) {
     renderFlightPath(flight);
 }
-window.debouncedRenderFlightPath = renderFlightPathImmediate; // Expose globally
+window.debouncedRenderFlightPath = renderFlightPathImmediate;
 
 function selectFlight(flightId) {
     if (!flightId) return;
@@ -218,8 +227,16 @@ function updateFlightPathsFromData(data) {
             delete flightLines[id];
         }
     });
-    console.log(`Processing ${data.length} flights for rendering`);
     data.forEach(flight => window.debouncedRenderFlightPath(flight));
     updateFlightList();
     updateStats();
 }
+
+// Ensure global access
+window.shouldRenderPath = function (flight) {
+    const selectedClasses = getSelectedClasses();
+    const flightClass = flight.classification || 'N/A';
+    return selectedClasses.length === 0 ||
+        flight.flight_id === selectedFlightId ||
+        selectedClasses.includes(flightClass);
+};

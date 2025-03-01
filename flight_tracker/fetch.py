@@ -92,5 +92,8 @@ def fetch_flight_data(area):
         return states
     
     except requests.RequestException as e:
-        logger.error(f"Failed to fetch data for area {area.id}: {e}")
+        if response.status_code == 429:
+            logger.warning(f"OpenSky API rate limit exceeded: {response.text}")
+        else:
+            logger.error(f"Failed to fetch data for area {area.id}: {e}")
         return None

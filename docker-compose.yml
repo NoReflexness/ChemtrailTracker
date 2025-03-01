@@ -14,9 +14,9 @@ services:
     deploy:
       resources:
         limits:
-          memory: 2g # Increase memory limit to 2GB
-          cpus: "2" # Allocate 2 CPUs
-
+          memory: 2g
+          cpus: "2"
+    command: gunicorn -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker -w 1 --timeout 300 -b 0.0.0.0:5000 "flight_tracker:create_app()"
   postgres:
     image: postgres:15
     environment:

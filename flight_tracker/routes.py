@@ -1,9 +1,11 @@
 # flight_tracker/routes.py
 from flask import render_template, request, jsonify
 from flight_tracker.utils import logger
-from flight_tracker.models import db, MonitoredArea, FlightPath
+from flight_tracker.models import db, MonitoredArea, FlightPath, Classification
 from flight_tracker.monitoring import start_monitoring_thread
 from flight_tracker.ml_model import train_model
+from flight_tracker.analysis import analyze_flight
+from sklearn.utils.validation import check_is_fitted
 
 def register_routes(app, socketio):
     @app.route('/add_area', methods=['POST'])
@@ -44,6 +46,24 @@ def register_routes(app, socketio):
         logger.info(f"Started monitoring for area ID {area.id}")
         return jsonify({'message': 'Monitoring started', 'area_id': area.id}), 200
 
+    @app.route('/start_monitoring_existing', methods=['POST'])
+    def start_monitoring_existing():
+        data = request.get_json()
+        area_id = data.get('area_id')
+        frequency = data.get('frequency')
+        if not area_id or not frequency:
+            return jsonify({'error': 'Missing area_id or frequency'}), 400
+        area = MonitoredArea.query.get(area_id)
+        if not area:
+            return jsonify({'error': 'Area not found'}), 404
+        if not area.is_monitoring:
+            area.is_monitoring = True
+            area.frequency = frequency
+            db.session.commit()
+            start_monitoring_thread(app, socketio, area, app.config['selected_classifications'])
+            logger.info(f"Started monitoring for area ID {area.id}")
+        return jsonify({'message': 'Monitoring started', 'area_id': area.id}), 200
+
     @app.route('/stop_monitoring', methods=['POST'])
     def stop_monitoring():
         data = request.get_json()
@@ -73,7 +93,8 @@ def register_routes(app, socketio):
                 'lomin': area.lomin,
                 'lomax': area.lomax,
                 'frequency': area.frequency,
-                'is_monitoring': area.is_monitoring
+                'is_monitoring': area.is_monitoring,
+                'name': area.name
             }
             for area in areas
         ]
@@ -82,6 +103,8 @@ def register_routes(app, socketio):
     @app.route('/flight_paths', methods=['GET'])
     def get_flight_paths():
         classifications = request.args.getlist('classifications')
+        page = int(request.args.get('page', 1))
+        per_page = int(request.args.get('per_page', 1000))  # Default to 1000 flights per page
         query = FlightPath.query
         if classifications:
             if 'N/A' in classifications:
@@ -92,7 +115,7 @@ def register_routes(app, socketio):
                 )
             else:
                 query = query.filter(FlightPath.classification.in_(classifications))
-        flights = query.all()
+        paginated = query.paginate(page=page, per_page=per_page, error_out=False)
         flight_data = [
             {
                 'flight_id': flight.flight_id,
@@ -103,10 +126,15 @@ def register_routes(app, socketio):
                 'avg_velocity': flight.avg_velocity,
                 'duration': flight.duration
             }
-            for flight in flights
+            for flight in paginated.items
         ]
-        logger.debug(f"Returning {len(flight_data)} flights for classifications: {classifications}")
-        return jsonify(flight_data)
+        logger.debug(f"Returning {len(flight_data)} flights for classifications: {classifications}, page: {page}")
+        return jsonify({
+            'flights': flight_data,
+            'total': paginated.total,
+            'pages': paginated.pages,
+            'page': page
+        })
 
     @app.route('/flight_count', methods=['GET'])
     def get_flight_count():
@@ -179,3 +207,81 @@ def register_routes(app, socketio):
             return jsonify({'message': 'Area deleted', 'area_id': area_id}), 200
         logger.warning(f"Area ID {area_id} not found for deletion")
         return jsonify({'error': 'Area not found'}), 404
+
+    @app.route('/update_area_name', methods=['POST'])
+    def update_area_name():
+        data = request.get_json()
+        area_id = data.get('area_id')
+        name = data.get('name')
+        if not area_id or not name:
+            return jsonify({'error': 'Missing area_id or name'}), 400
+        area = MonitoredArea.query.get(area_id)
+        if area:
+            area.name = name
+            db.session.commit()
+            logger.info(f"Area {area_id} renamed to {name}")
+            return jsonify({'message': 'Area name updated'}), 200
+        return jsonify({'error': 'Area not found'}), 404
+
+    @app.route('/area_classifications', methods=['GET'])
+    def get_area_classifications():
+        area_id = request.args.get('area_id')
+        if area_id == 'all':
+            flights = FlightPath.query.all()
+        else:
+            area = MonitoredArea.query.get(area_id)
+            if not area:
+                return jsonify({'error': 'Area not found'}), 404
+            flights = []
+            all_flights = FlightPath.query.all()
+            for flight in all_flights:
+                points = flight.points_list
+                if any(p[0] >= area.lamin and p[0] <= area.lamax and p[1] >= area.lomin and p[1] <= area.lomax for p in points):
+                    flights.append(flight)
+        classifications = {}
+        for flight in flights:
+            cls = flight.classification or 'N/A'
+            classifications[cls] = classifications.get(cls, 0) + 1
+        logger.debug(f"Area {area_id} classifications: {classifications}")
+        return jsonify(classifications)
+
+    @app.route('/classifications', methods=['GET'])
+    def get_classifications():
+        classifications = Classification.query.all()
+        return jsonify([{'name': c.name, 'color': c.color} for c in classifications])
+
+    @app.route('/add_classification', methods=['POST'])
+    def add_classification():
+        data = request.get_json()
+        name = data.get('name')
+        color = data.get('color')
+        if not name or not color:
+            return jsonify({'error': 'Missing name or color'}), 400
+        if Classification.query.filter_by(name=name).first():
+            return jsonify({'error': 'Classification already exists'}), 400
+        classification = Classification(name=name, color=color)
+        db.session.add(classification)
+        db.session.commit()
+        logger.info(f"Added classification {name} with color {color}")
+        return jsonify({'message': 'Classification added'}), 200
+
+    @app.route('/ml_stats', methods=['GET'])
+    def get_ml_stats():
+        flights = FlightPath.query.filter_by(auto_classified=False).filter(FlightPath.classification.isnot(None)).all()
+        samples = len(flights)
+        classes = len(set(f.classification for f in flights))
+        retrainRecommended = samples >= 10 and classes > 1
+        # Use check_is_fitted to determine if the model is trained
+        status = 'Not loaded'
+        if hasattr(analyze_flight, 'model') and analyze_flight.model is not None:
+            try:
+                check_is_fitted(analyze_flight.model)
+                status = 'Trained'
+            except:
+                status = 'Loaded but not trained'
+        return jsonify({
+            'status': status,
+            'samples': samples,
+            'classes': classes,
+            'retrainRecommended': retrainRecommended
+        })

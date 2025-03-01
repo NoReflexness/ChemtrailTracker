@@ -24,26 +24,40 @@ function getSelectedClasses() {
 
 function updateFlightPaths() {
     const selectedClasses = getSelectedClasses();
-    const url = selectedClasses.length > 0
+    const baseUrl = selectedClasses.length > 0
         ? `/flight_paths?${selectedClasses.map(cls => `classifications=${cls}`).join('&')}`
         : '/flight_paths';
-    fetch(url)
-        .then(response => {
-            if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
-            return response.json();
-        })
-        .then(data => {
-            console.log('Fetched flight paths:', data);
-            updateFlightPathsFromData(data);
-            fetchTotalFlights(); // Fetch total separately
-            const classCounts = data.reduce((acc, f) => {
-                acc[f.classification || 'N/A'] = (acc[f.classification || 'N/A'] || 0) + 1;
-                return acc;
-            }, {});
-            canRetrain = Object.keys(classCounts).length > 1 && data.length >= 10;
-            document.getElementById('retrain-btn').disabled = !canRetrain;
-        })
-        .catch(error => console.error('Error fetching paths:', error));
+    let page = 1;
+    const perPage = 1000;
+    let allFlights = [];
+
+    function fetchPage() {
+        const url = `${baseUrl}&page=${page}&per_page=${perPage}`;
+        return fetch(url)
+            .then(response => {
+                if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+                return response.json();
+            })
+            .then(data => {
+                allFlights = allFlights.concat(data.flights);
+                if (page < data.pages) {
+                    page++;
+                    return fetchPage(); // Recursive fetch for next page
+                }
+                console.log('Fetched all flight paths:', allFlights.length);
+                updateFlightPathsFromData(allFlights);
+                fetchTotalFlights();
+                const classCounts = allFlights.reduce((acc, f) => {
+                    acc[f.classification || 'N/A'] = (acc[f.classification || 'N/A'] || 0) + 1;
+                    return acc;
+                }, {});
+                canRetrain = Object.keys(classCounts).length > 1 && allFlights.length >= 10;
+                document.getElementById('retrain-btn').disabled = !canRetrain;
+            })
+            .catch(error => console.error('Error fetching paths:', error));
+    }
+
+    fetchPage();
 }
 
 function fetchTotalFlights() {
@@ -68,9 +82,8 @@ function updateFlightList() {
 
     Object.keys(flightLines).forEach(id => {
         const flight = flightLines[id];
-        const popupContent = flight.line?.getPopup()?.getContent() || flight.marker?.getPopup()?.getContent() || '';
-        const currentClass = popupContent.match(/Class: (.*?)(?:\s|$)/)?.[1] || 'N/A';
-        const source = popupContent.match(/\((.*?)\)/)?.[1] || 'N/A';
+        const classification = flight.classification || 'N/A';
+        const source = flight.classification_source || 'N/A';
         const lastPoint = flight.points[flight.points.length - 1];
         const altitude = lastPoint[3] === -1 ? 'N/A' : `${lastPoint[3]} m`;
         const velocity = lastPoint[4] === -1 ? 'N/A' : `${lastPoint[4]} m/s`;
@@ -80,9 +93,9 @@ function updateFlightList() {
         const heading = flight.lastRotation ? `${Math.round(flight.lastRotation)}°` : 'N/A';
 
         const shouldShow = selectedClasses.length === 0 ||
-            selectedClasses.includes(currentClass) ||
+            selectedClasses.includes(classification) ||
             id === selectedFlightId;
-        const willRender = shouldRenderPath(flight); // Sync with renderer
+        const willRender = window.shouldRenderPath(flight);
 
         if (shouldShow) {
             const div = document.createElement('div');
@@ -104,9 +117,7 @@ function updateFlightList() {
                         <div><svg class="icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#e0e0e0" stroke-width="2"><path d="M12 2v6m0 10v6m-6-12h12"/></svg><span>Duration: ${duration}</span></div>
                     </div>
                     <select onchange="updateClassification('${id}', this.value)">
-                        ${Array.from(document.getElementById('class-filter').options).map(opt =>
-                    `<option value="${opt.value}" ${currentClass === opt.value ? 'selected' : ''}>${opt.value || 'N/A'}</option>`
-                ).join('')}
+                        ${classifications.map(cls => `<option value="${cls.name}" ${classification === cls.name ? 'selected' : ''}>${cls.name}</option>`).join('')}
                     </select>
                     <span class="source">(${source})</span>
                 `;
@@ -116,18 +127,18 @@ function updateFlightList() {
                     <svg class="icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#e0e0e0" stroke-width="2">
                         <path d="M20.5 3.5L3.5 12L9.5 14.5L15.5 9.5L10.5 15.5L13 20.5L20.5 3.5Z"/>
                     </svg>
-                    <span>${id} - ${currentClass}</span>
+                    <span>${id} - ${classification}</span>
                 `;
             }
-            div.dataset.classification = currentClass;
+            div.dataset.classification = classification;
             div.style.backgroundColor = id === selectedFlightId ? '#3c3c3c' : '';
             div.onclick = () => selectFlight(id);
             div.tabIndex = 0;
             list.appendChild(div);
-            if (willRender) visibleFlightCount++; // Only count if rendered
+            if (willRender) visibleFlightCount++;
         }
     });
-    filterFlights(); // Will update visible count again
+    filterFlights();
     document.getElementById('filtered-flight-count').innerText = visibleFlightCount;
     console.log(`Visible flights: ${visibleFlightCount}, Total flights: ${totalFlights}`);
 }
@@ -173,7 +184,7 @@ function filterFlights() {
             selectedClasses.includes(classification) ||
             flightId === selectedFlightId;
         const shouldShow = matchesText && matchesClass && matchesPathSelection;
-        const willRender = shouldRenderPath(flight); // Sync with renderer
+        const willRender = window.shouldRenderPath(flight);
 
         div.style.display = shouldShow ? '' : 'none';
         if (shouldShow && willRender) visibleFlightCount++;
