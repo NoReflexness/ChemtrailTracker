@@ -1,0 +1,2426 @@
+Project Description: Flight Tracker Dashboard
+Purpose:
+The Flight Tracker Dashboard is a web application built with Flask, Socket.IO, and Leaflet.js to monitor and visualize real-time flight data from the OpenSky Network API. 
+It allows users to define monitored areas on a map, track flights within those areas, classify flights (e.g., commercial, survey) using rule-based and ML methods, and display flight paths and markers interactively. 
+The project aims to provide a performant, user-friendly interface for analyzing flight patterns, with features like area selection, flight selection, and dynamic path rendering.
+The user should be able to manage flight pattern classifications and using machine learning teach the system various flights pattern classifications.
+The end goal is a system that can be used to identify flights and flight companies that perform non commercial flights like rescue, crop dusting, chemtrail and cloud seeding missions. These missions often have grid like patterns or other detectable pattern with lots of parallel lines repeating on top of each other or in a grid or zig zag or circular patterns at various altitudes. a goal is to using mathematical principles to identify a significant amount of these and with manuel input along side this train an ml model to identify more flights with better acuracy.
+
+Key Features:  
+Map Interface: Displays flights and monitored areas using Leaflet.js with OpenStreetMap tiles.
+Markers (airplane SVGs) show current positions, rotated by bearing.
+
+Polylines represent flight paths, toggled by classification checkboxes.
+
+Areas are drawn with shift-click-drag, filled faintly when selected.
+
+Flight Data: Fetched from OpenSky API, stored in SQLite, and updated in real-time via Socket.IO.
+Paths use full points for selected flights or < 200 total flights; simplified otherwise.
+
+Controls: 
+Frequency dropdown (30s, 1m, 5m) sets update intervals.
+
+Buttons (monitor, delete, retrain) with icons manage areas and ML model.
+
+Checkboxes toggle path visibility by classification, with cookie persistence.
+
+Active Flights List: Scrollable list of flights, filterable by text/classification, selectable with arrow keys.
+
+Logs: Real-time server logs displayed in a scrollable footer.
+
+Performance: Optimized with batch processing (500 flights), WAL mode SQLite, and MarkerClusterGroup.
+
+Known Issues: 
+- when selecting a flight the flightpath for that should be fetched immediately and updated on the map
+- when a set of classifications are selected in the UI the flights data should be filtered from the backend so the markerclusters and the paths are only for the selected flights (for better performance en reduced graohics clutter)
+
+Technology Stack:  
+Backend: Flask, Flask-SocketIO, SQLAlchemy (Postgres), Python (OpenSky API client).
+
+Frontend: Leaflet.js, MarkerCluster, Socket.IO client, js-cookie, Font Awesome.
+
+Files: Organized in flight_tracker/ with static assets in static/css/ and static/js/.
+
+Immidiate next steps:
+- Clean up the repo, make sure the source code uses best practices for layout and design patterns, reduce code duplications.
+- Tackle the known issues in the UX
+
+AI instruction:
+- keep track of the entire source code
+
+Source Code
+flight_tracker/__init__.py
+python
+
+from flask import Flask
+from flask_socketio import SocketIO
+from flight_tracker.utils import logger, setup_logging
+from flight_tracker.models import db, FlightPath
+from flight_tracker.monitoring import init_indexes
+from flight_tracker.analysis import start_buffer_thread
+import json
+import os
+
+def create_app():
+    app = Flask(__name__)
+    socketio = SocketIO(app, manage_session=False)  # Disable session management to avoid conflicts
+
+    setup_logging(socketio)
+
+    from flight_tracker.routes import register_routes
+    from flight_tracker.monitoring import start_monitoring
+
+    uri = 'postgresql://user:password@postgres:5432/flight_tracker'
+    logger.info(f"Using database URI: {uri}")
+    app.config['SQLALCHEMY_DATABASE_URI'] = uri
+    app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+    db.init_app(app)
+    
+    with app.app_context():
+        db.create_all()
+        
+        for flight in db.session.query(FlightPath).all():
+            try:
+                points = json.loads(flight.points) if flight.points else []
+                if not isinstance(points, list) or (points and not all(isinstance(p, list) for p in points)):
+                    logger.warning(f"Fixing corrupt points for {flight.flight_id}: {flight.points}")
+                    flight.points = json.dumps([])
+                    db.session.commit()
+                flight.update_stats()
+            except json.JSONDecodeError:
+                logger.warning(f"Resetting corrupt JSON for {flight.flight_id}")
+                flight.points = json.dumps([])
+                db.session.commit()
+
+        if not db.session.query(FlightPath).first() and os.path.exists('initial_data.json'):
+            try:
+                with open('initial_data.json', 'r') as f:
+                    data = json.load(f)
+                    for item in data:
+                        flight = FlightPath(
+                            flight_id=item['flight_id'],
+                            points=item['points'],
+                            last_updated=item['points'][-1][2]
+                        )
+                        flight.classification = item['classification']
+                        flight.auto_classified = item['auto_classified']
+                        flight.update_stats()
+                        db.session.add(flight)
+                    db.session.commit()
+                    from flight_tracker.ml_model import train_model
+                    train_model()
+                    logger.info("Initial data loaded and model trained")
+            except FileNotFoundError:
+                logger.warning("initial_data.json not found, skipping initial data load")
+            except Exception as e:
+                logger.error(f"Failed to load initial data: {e}")
+                db.session.rollback()
+
+    register_routes(app, socketio)
+    start_buffer_thread(socketio)
+
+    @socketio.on('connect')
+    def handle_connect():
+        logger.info("Client connected")
+        start_monitoring(app, socketio)
+
+    @socketio.on('disconnect')
+    def handle_disconnect(arg=None):
+        logger.info("Client disconnected")
+
+    @socketio.on_error_default
+    def handle_error(e):
+        logger.error(f"Socket.IO error: {e}")
+
+    return app, socketio
+
+flight_tracker/models.py
+python
+
+from flask_sqlalchemy import SQLAlchemy
+import json
+
+db = SQLAlchemy()
+
+def init_db(app):
+    app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:////data/flights.db'
+    app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+    db.init_app(app)
+    with app.app_context():
+        db.create_all()
+
+class MonitoredArea(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    lamin = db.Column(db.Float, nullable=False)
+    lamax = db.Column(db.Float, nullable=False)
+    lomin = db.Column(db.Float, nullable=False)
+    lomax = db.Column(db.Float, nullable=False)
+    frequency = db.Column(db.String(10), nullable=False)
+    is_monitoring = db.Column(db.Boolean, default=False)
+
+class FlightPath(db.Model):
+    flight_id = db.Column(db.String(20), primary_key=True)
+    points = db.Column(db.Text, nullable=True)  # JSON-encoded list of [lat, lon, timestamp, alt, vel]
+    last_updated = db.Column(db.Integer, nullable=False)
+    classification = db.Column(db.String(20))
+    classification_source = db.Column(db.String(20))
+    auto_classified = db.Column(db.Boolean, default=True)
+    avg_altitude = db.Column(db.Float, default=-1)
+    avg_velocity = db.Column(db.Float, default=-1)
+    duration = db.Column(db.Integer, default=0)
+
+    def __init__(self, flight_id, points=None, last_updated=0):
+        self.flight_id = flight_id
+        self.points = json.dumps(points) if points else None
+        self.last_updated = last_updated
+        self.update_stats()
+
+    def update_stats(self):
+        if self.points:
+            points = json.loads(self.points) if isinstance(self.points, str) else self.points
+            normalized_points = []
+            for p in points:
+                if not isinstance(p, list):
+                    logger.warning(f"Invalid point format for {self.flight_id}: {p}")
+                    continue
+                while len(p) < 5:
+                    p.append(-1)
+                normalized_points.append(p)
+            self.points = json.dumps(normalized_points)
+            altitudes = [p[3] for p in normalized_points if p[3] != -1]
+            velocities = [p[4] for p in normalized_points if p[4] != -1]
+            timestamps = [p[2] for p in normalized_points]
+            self.avg_altitude = sum(altitudes) / len(altitudes) if altitudes else -1
+            self.avg_velocity = sum(velocities) / len(velocities) if velocities else -1
+            self.duration = max(timestamps) - min(timestamps) if len(timestamps) > 1 else 0
+
+    @property
+    def points_list(self):
+        if self.points:
+            points = json.loads(self.points) if isinstance(self.points, str) else self.points
+            normalized_points = []
+            for p in points:
+                if not isinstance(p, list):
+                    logger.warning(f"Invalid point format on read for {self.flight_id}: {p}")
+                    continue
+                while len(p) < 5:
+                    p.append(-1)
+                normalized_points.append(p)
+            return normalized_points
+        return []
+
+flight_tracker/utils.py
+python
+
+import logging
+from flask_socketio import SocketIO
+
+logger = logging.getLogger(__name__)
+
+class SocketIOHandler(logging.Handler):
+    def __init__(self, socketio):
+        super().__init__()
+        self.socketio = socketio
+
+    def emit(self, record):
+        log_entry = self.format(record)
+        self.socketio.emit('log', {'message': log_entry})
+
+def setup_logging(socketio):
+    logging.basicConfig(level=logging.INFO)
+    logger.addHandler(SocketIOHandler(socketio))
+
+flight_tracker/analysis.py
+python
+
+# flight_tracker/analysis.py (updated)
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.utils.validation import check_is_fitted
+import numpy as np
+from flight_tracker.utils import logger
+from flight_tracker.ml_model import load_model, save_model
+import threading
+import time
+
+classification_log_buffer = []
+ml_failure_buffer = []
+buffer_lock = threading.Lock()
+first_ml_failure_logged = False
+
+def flush_log_buffers(socketio):
+    global first_ml_failure_logged
+    while True:
+        time.sleep(5)
+        with buffer_lock:
+            if classification_log_buffer:
+                socketio.emit('log', {'message': '\n'.join(classification_log_buffer)})
+                classification_log_buffer.clear()
+            if ml_failure_buffer:
+                count = len(ml_failure_buffer)
+                if not first_ml_failure_logged:
+                    socketio.emit('log', {'message': f"ML model not fitted or failed: {ml_failure_buffer[0]}"})
+                    first_ml_failure_logged = True
+                socketio.emit('log', {'message': f"ML not fitted for {count} flights, using rule-based fallback"})
+                ml_failure_buffer.clear()
+
+def start_buffer_thread(socketio):
+    thread = threading.Thread(target=flush_log_buffers, args=(socketio,), daemon=True)
+    thread.start()
+
+def analyze_flight(flight):
+    if not hasattr(analyze_flight, 'model'):
+        analyze_flight.model = load_model() or RandomForestClassifier(n_estimators=100, random_state=42)
+
+    points = flight.points_list or []
+    if not points or len(points) < 2:
+        flight.classification = None
+        flight.classification_source = None
+        flight.auto_classified = False
+        return
+
+    valid_points = [p for p in points if isinstance(p, list) and len(p) >= 3]
+    if len(valid_points) < 2:
+        logger.warning(f"Invalid points data for flight {flight.flight_id}: {points}")
+        flight.classification = None
+        flight.classification_source = None
+        flight.auto_classified = False
+        return
+
+    altitudes = [p[3] if len(p) > 3 and p[3] != -1 else -1 for p in valid_points]
+    velocities = [p[4] if len(p) > 4 and p[4] != -1 else -1 for p in valid_points]
+    lat_lons = [(p[0], p[1]) for p in valid_points]
+
+    # Turns
+    turns = 0
+    if len(lat_lons) > 2:
+        for i in range(len(lat_lons) - 2):
+            v1 = (lat_lons[i+1][0] - lat_lons[i][0], lat_lons[i+1][1] - lat_lons[i][1])
+            v2 = (lat_lons[i+2][0] - lat_lons[i+1][0], lat_lons[i+2][1] - lat_lons[i+1][1])
+            dot = v1[0] * v2[0] + v1[1] * v2[1]
+            mag1 = (v1[0]**2 + v1[1]**2)**0.5
+            mag2 = (v2[0]**2 + v2[1]**2)**0.5
+            if mag1 * mag2 > 0:
+                cos_angle = dot / (mag1 * mag2)
+                if cos_angle < 0.7:
+                    turns += 1
+
+    # Parallelism (grid-like)
+    parallelism_score = 0
+    angles = []
+    if len(lat_lons) > 3:
+        for i in range(len(lat_lons) - 1):
+            dx = lat_lons[i+1][1] - lat_lons[i][1]
+            dy = lat_lons[i+1][0] - lat_lons[i][0]
+            angle = np.arctan2(dy, dx) * 180 / np.pi
+            angles.append(angle)
+        for i in range(len(angles) - 2):
+            if abs((angles[i] - angles[i+2] + 180) % 360 - 180) < 10:
+                parallelism_score += 1
+        parallelism_score /= len(lat_lons)
+
+    # Circularity
+    circularity = 0
+    if len(lat_lons) > 5:
+        x = [p[1] for p in lat_lons]
+        y = [p[0] for p in lat_lons]
+        x_m = np.mean(x)
+        y_m = np.mean(y)
+        u = [xi - x_m for xi in x]
+        v = [yi - y_m for yi in y]
+        Suu = sum(ui * ui for ui in u)
+        Svv = sum(vi * vi for vi in v)
+        Suv = sum(ui * vi for ui, vi in zip(u, v))
+        radius = np.sqrt((Suu + Svv) / len(lat_lons)) if (Suu + Svv) > 0 else 0
+        residuals = [abs(np.sqrt((xi - x_m)**2 + (yi - y_m)**2) - radius) for xi, yi in zip(x, y)]
+        circularity = 1 - (np.mean(residuals) / radius) if radius > 0 else 0
+
+    # Zig-zag
+    zig_zag_count = 0
+    if len(angles) > 2:
+        for i in range(len(angles) - 1):
+            angle_diff = abs((angles[i+1] - angles[i] + 180) % 360 - 180)
+            if angle_diff > 45 and angle_diff < 135:
+                zig_zag_count += 1
+        zig_zag_count /= len(lat_lons)
+
+    # Additional features (Suggestion 1)
+    segment_lengths = []
+    for i in range(len(lat_lons) - 1):
+        dx = (lat_lons[i+1][1] - lat_lons[i][1]) * 111.32 * np.cos(lat_lons[i][0] * np.pi / 180)
+        dy = (lat_lons[i+1][0] - lat_lons[i][0]) * 111.32
+        segment_lengths.append(np.sqrt(dx**2 + dy**2))
+    segment_length_std = np.std(segment_lengths) if segment_lengths else 0
+    altitude_variability = np.std([a for a in altitudes if a != -1]) if any(a != -1 for a in altitudes) else 0
+
+    features = [
+        np.mean(altitudes) if any(a != -1 for a in altitudes) else -1,
+        np.mean(velocities) if any(v != -1 for v in velocities) else -1,
+        turns / len(valid_points) if valid_points else 0,
+        parallelism_score,
+        circularity,
+        zig_zag_count,
+        segment_length_std,
+        altitude_variability
+    ]
+
+    # Rule-based classification
+    if features[0] > 5000 and features[1] > 100:
+        flight.classification = 'commercial'
+        flight.classification_source = 'rule'
+        flight.auto_classified = False
+    elif features[0] < 1000 and features[2] > 0.1:
+        flight.classification = 'survey'
+        flight.classification_source = 'rule'
+        flight.auto_classified = False
+    elif features[0] < 2000 and features[1] < 50 and features[3] > 0.2:
+        flight.classification = 'cloud seeding'
+        flight.classification_source = 'rule'
+        flight.auto_classified = False
+    elif features[0] < 1000 and features[5] > 0.3:
+        flight.classification = 'crop dusting'
+        flight.classification_source = 'rule'
+        flight.auto_classified = False
+    elif features[0] < 2000 and features[4] > 0.7:
+        flight.classification = 'rescue'
+        flight.classification_source = 'rule'
+        flight.auto_classified = False
+    else:
+        try:
+            check_is_fitted(analyze_flight.model)
+            prediction = analyze_flight.model.predict([features])[0]
+            flight.classification = prediction
+            flight.classification_source = 'ml'
+            flight.auto_classified = True
+            with buffer_lock:
+                classification_log_buffer.append(f"Classified flight {flight.flight_id} as {prediction} (ML)")
+        except Exception as e:
+            with buffer_lock:
+                ml_failure_buffer.append(str(e))
+            flight.classification = None
+            flight.classification_source = None
+            flight.auto_classified = False
+
+flight_tracker/monitoring.py
+python
+
+import requests
+import time
+import threading
+import configparser
+import json
+from flight_tracker.utils import logger
+from flight_tracker.models import db, MonitoredArea, FlightPath
+from flight_tracker.analysis import analyze_flight
+from sqlalchemy.orm import attributes, scoped_session, sessionmaker
+from sqlalchemy import text
+import sqlalchemy.exc
+
+BASE_URL = "https://opensky-network.org/api/states/all"
+config = configparser.ConfigParser()
+config.read('/root/.config/pyopensky/settings.conf')
+USERNAME = config['opensky']['username']
+PASSWORD = config['opensky']['password']
+
+credits_used = 0
+MAX_CREDITS = 4000
+batch_lock = threading.Lock()
+
+def get_session():
+    """Create a thread-local scoped session."""
+    if not hasattr(threading.current_thread(), '_session_factory'):
+        threading.current_thread()._session_factory = sessionmaker(bind=db.engine)
+    return scoped_session(threading.current_thread()._session_factory)
+
+def calculate_credit_cost(lamin, lamax, lomin, lomax):
+    area = (lamax - lamin) * (lomax - lomin)
+    if area <= 25:
+        return 1
+    elif area <= 100:
+        return 2
+    elif area <= 400:
+        return 3
+    else:
+        return 4
+
+def fetch_flight_data(area):
+    global credits_used
+    cost = calculate_credit_cost(area.lamin, area.lamax, area.lomin, area.lomax)
+    if credits_used + cost > MAX_CREDITS:
+        logger.warning("Credit limit reached for today.")
+        return None
+    
+    params = {"lamin": area.lamin, "lamax": area.lamax, "lomin": area.lomin, "lomax": area.lomax}
+    try:
+        response = requests.get(BASE_URL, params=params, auth=(USERNAME, PASSWORD), timeout=30)
+        response.raise_for_status()
+        states = response.json()
+        if not states or 'states' not in states or states['states'] is None:
+            logger.warning(f"Invalid API response for area {area.id}: {states}")
+            return None
+        states_count = len(states['states'])
+        logger.info(f"Fetched {states_count} states for area {area.id}")
+        for state in states['states']:
+            if not all(isinstance(state[i], (int, float, str, type(None))) for i in [0, 5, 6, 7, 9]):
+                logger.warning(f"Invalid state data for flight {state[0]}: {state}")
+                states['states'] = [s for s in states['states'] if all(isinstance(s[i], (int, float, str, type(None))) for i in [0, 5, 6, 7, 9])]
+                break
+        credits_used += cost
+        logger.info(f"Fetched data for area {area.id}. Credits used: {credits_used}/{MAX_CREDITS}")
+        return states
+    except requests.RequestException as e:
+        logger.error(f"Failed to fetch data for area {area.id}: {e}")
+        return None
+
+def cleanup_old_flights(session, socketio):  # Add socketio param
+    cutoff = int(time.time()) - (24 * 3600)
+    try:
+        result = session.execute(
+            text("DELETE FROM flight_path WHERE last_updated < :cutoff RETURNING flight_id"),
+            {"cutoff": cutoff}
+        )
+        deleted_flight_ids = [row[0] for row in result]
+        session.commit()
+        logger.debug("Cleaned up old flights")
+        if deleted_flight_ids:
+            socketio.emit('flight_cleanup', {'flight_ids': deleted_flight_ids})
+    except Exception as e:
+        logger.error(f"Error during cleanup: {e}")
+        session.rollback()
+
+def process_states(states, socketio):
+    if not states or 'states' not in states or states['states'] is None:
+        logger.warning(f"No valid states data to process: {states}")
+        return
+    
+    timestamp = states['time']
+    flight_updates = []
+    new_flights = []
+    processed_flight_ids = set()
+    batch_size = 500
+    update_buffer = []
+
+    session = get_session()
+    try:
+        for state in states['states']:
+            flight_id = state[0]
+            lon = state[5]
+            lat = state[6]
+            alt = state[7] if state[7] is not None else -1
+            vel = state[9] if state[9] is not None else -1
+            if lat is None or lon is None:
+                logger.debug(f"Skipping flight {flight_id} due to missing lat/lon")
+                continue
+
+            new_point = [lat, lon, timestamp, alt, vel]
+            if flight_id in processed_flight_ids:
+                continue
+
+            flight = session.get(FlightPath, flight_id)
+            if flight:
+                current_points = flight.points_list
+                current_coords = [[p[0], p[1]] for p in current_points]
+                if [lat, lon] not in current_coords:
+                    current_points.append(new_point)
+                    current_points.sort(key=lambda p: p[2])
+                    flight.points = json.dumps(current_points)
+                    attributes.flag_modified(flight, "points")
+                    flight.last_updated = timestamp
+                    flight.update_stats()
+                    analyze_flight(flight)
+                    update_buffer.append({
+                        'flight_id': flight_id,
+                        'points': flight.points_list,
+                        'classification': flight.classification,
+                        'classification_source': flight.classification_source,
+                        'avg_altitude': flight.avg_altitude,
+                        'avg_velocity': flight.avg_velocity,
+                        'duration': flight.duration
+                    })
+                    logger.debug(f"Updated flight {flight_id} with new point: {new_point}")
+            else:
+                new_flight = FlightPath(flight_id=flight_id, points=[new_point], last_updated=timestamp)
+                new_flight.update_stats()
+                analyze_flight(new_flight)
+                new_flights.append(new_flight)
+                processed_flight_ids.add(flight_id)
+                update_buffer.append({
+                    'flight_id': new_flight.flight_id,
+                    'points': new_flight.points_list,
+                    'classification': new_flight.classification,
+                    'classification_source': new_flight.classification_source,
+                    'avg_altitude': new_flight.avg_altitude,
+                    'avg_velocity': new_flight.avg_velocity,
+                    'duration': new_flight.duration
+                })
+                logger.debug(f"Queued new flight {flight_id}")
+
+            if len(new_flights) >= batch_size or len(update_buffer) >= batch_size:
+                with batch_lock:
+                    try:
+                        if new_flights:
+                            session.execute(
+                                text("""
+                                    INSERT INTO flight_path (flight_id, points, last_updated, auto_classified, avg_altitude, avg_velocity, duration)
+                                    VALUES (:flight_id, :points, :last_updated, :auto_classified, :avg_altitude, :avg_velocity, :duration)
+                                    ON CONFLICT (flight_id) DO UPDATE
+                                    SET points = EXCLUDED.points,
+                                        last_updated = EXCLUDED.last_updated,
+                                        auto_classified = EXCLUDED.auto_classified,
+                                        avg_altitude = EXCLUDED.avg_altitude,
+                                        avg_velocity = EXCLUDED.avg_velocity,
+                                        duration = EXCLUDED.duration
+                                """),
+                                [{
+                                    'flight_id': nf.flight_id,
+                                    'points': nf.points,
+                                    'last_updated': nf.last_updated,
+                                    'auto_classified': nf.auto_classified,
+                                    'avg_altitude': nf.avg_altitude,
+                                    'avg_velocity': nf.avg_velocity,
+                                    'duration': nf.duration
+                                } for nf in new_flights]
+                            )
+                            session.commit()
+                            logger.info(f"Upserted {len(new_flights)} new flights")
+                            new_flights.clear()
+
+                        if update_buffer:
+                            flight_updates.extend(update_buffer)
+                            logger.debug(f"Emitting {len(flight_updates)} flights in batch")
+                            while flight_updates:
+                                batch = flight_updates[:100]
+                                socketio.emit('flight_batch_update', {'flights': batch})
+                                flight_updates = flight_updates[100:]
+                                logger.debug(f"Sent batch of {len(batch)} flights")
+                            session.commit()
+                            update_buffer.clear()
+                            socketio.sleep(0.1)
+                    except Exception as e:
+                        logger.error(f"Error during batch processing: {e}")
+                        session.rollback()
+                        new_flights.clear()
+                        update_buffer.clear()
+                        flight_updates.clear()
+
+        with batch_lock:
+            try:
+                if new_flights:
+                    session.execute(
+                        text("""
+                            INSERT INTO flight_path (flight_id, points, last_updated, auto_classified, avg_altitude, avg_velocity, duration)
+                            VALUES (:flight_id, :points, :last_updated, :auto_classified, :avg_altitude, :avg_velocity, :duration)
+                            ON CONFLICT (flight_id) DO UPDATE
+                            SET points = EXCLUDED.points,
+                                last_updated = EXCLUDED.last_updated,
+                                auto_classified = EXCLUDED.auto_classified,
+                                avg_altitude = EXCLUDED.avg_altitude,
+                                avg_velocity = EXCLUDED.avg_velocity,
+                                duration = EXCLUDED.duration
+                        """),
+                        [{
+                            'flight_id': nf.flight_id,
+                            'points': nf.points,
+                            'last_updated': nf.last_updated,
+                            'auto_classified': nf.auto_classified,
+                            'avg_altitude': nf.avg_altitude,
+                            'avg_velocity': nf.avg_velocity,
+                            'duration': nf.duration
+                        } for nf in new_flights]
+                    )
+                    session.commit()
+                    logger.info(f"Upserted {len(new_flights)} new flights")
+                    new_flights.clear()
+
+                if update_buffer:
+                    flight_updates.extend(update_buffer)
+                    logger.debug(f"Emitting final {len(flight_updates)} flights")
+                    while flight_updates:
+                        batch = flight_updates[:100]
+                        socketio.emit('flight_batch_update', {'flights': batch})
+                        flight_updates = flight_updates[100:]
+                        logger.debug(f"Sent final batch of {len(batch)} flights")
+                    session.commit()
+                    update_buffer.clear()
+            except Exception as e:
+                logger.error(f"Error during final batch processing: {e}")
+                session.rollback()
+    finally:
+        session.remove()
+
+
+
+def monitor_area(app, socketio, area, frequency):
+    while True:
+        with app.app_context():
+            session = get_session()
+            try:
+                current_area = session.get(MonitoredArea, area.id)
+                if not current_area or not current_area.is_monitoring:
+                    logger.info(f"Area ID {area.id} no longer exists or stopped, stopping thread")
+                    break
+                states = fetch_flight_data(area)
+                if states:
+                    process_states(states, socketio)
+                cleanup_old_flights(session, socketio)  # Pass socketio
+            finally:
+                session.remove()
+        time.sleep(frequency)
+
+def start_monitoring_thread(app, socketio, area):
+    freq = {'30s': 30, '1m': 60, '5m': 300}[area.frequency]
+    thread = threading.Thread(target=monitor_area, args=(app, socketio, area, freq))
+    thread.daemon = True
+    thread.start()
+
+def start_monitoring(app, socketio):
+    with app.app_context():
+        session = get_session()
+        try:
+            areas = session.query(MonitoredArea).all()
+            for area in areas:
+                if area.is_monitoring:
+                    start_monitoring_thread(app, socketio, area)
+        finally:
+            session.remove()
+
+def init_indexes():
+    with app.app_context():
+        session = get_session()
+        try:
+            session.execute(text("CREATE INDEX IF NOT EXISTS idx_flight_id ON flight_path (flight_id)"))
+            session.execute(text("CREATE INDEX IF NOT EXISTS idx_last_updated ON flight_path (last_updated)"))
+            session.commit()
+            logger.info("Database indexes created")
+        except Exception as e:
+            logger.error(f"Error creating indexes: {e}")
+            session.rollback()
+        finally:
+            session.remove()
+
+
+
+flight_tracker/routes.py
+python
+
+from flask import render_template, request, jsonify
+from flight_tracker.utils import logger
+from flight_tracker.models import db, MonitoredArea, FlightPath
+from flight_tracker.monitoring import start_monitoring_thread
+from flight_tracker.ml_model import train_model
+
+def register_routes(app, socketio):
+    @app.route('/add_area', methods=['POST'])
+    def add_area():
+        data = request.get_json()
+        area = MonitoredArea(
+            lamin=data['lamin'],
+            lamax=data['lamax'],
+            lomin=data['lomin'],
+            lomax=data['lomax'],
+            frequency=data['frequency'],
+            is_monitoring=False
+        )
+        db.session.add(area)
+        db.session.commit()
+        return jsonify({'message': f'Area {area.id} added', 'area_id': area.id})
+    
+    @app.route('/')
+    def index():
+        return render_template('index.html')
+
+    @app.route('/start_monitoring', methods=['POST'])
+    def start_monitoring():
+        data = request.get_json()
+        lamin = data.get('lamin')
+        lamax = data.get('lamax')
+        lomin = data.get('lomin')
+        lomax = data.get('lomax')
+        frequency = data.get('frequency')
+
+        if not all([lamin, lamax, lomin, lomax, frequency]):
+            return jsonify({'error': 'Missing parameters'}), 400
+
+        area = MonitoredArea(lamin=lamin, lamax=lamax, lomin=lomin, lomax=lomax, frequency=frequency, is_monitoring=True)
+        db.session.add(area)
+        db.session.commit()
+        start_monitoring_thread(app, socketio, area)
+        logger.info(f"Started monitoring for area ID {area.id}")
+        return jsonify({'message': 'Monitoring started', 'area_id': area.id}), 200
+
+    @app.route('/stop_monitoring', methods=['POST'])
+    def stop_monitoring():
+        data = request.get_json()
+        area_id = data.get('area_id')
+        if not area_id:
+            logger.error("No area_id provided in stop_monitoring request")
+            return jsonify({'error': 'Missing area_id'}), 400
+
+        area = MonitoredArea.query.get(area_id)
+        if area:
+            area.is_monitoring = False
+            db.session.commit()
+            logger.info(f"Stopped monitoring for area ID {area_id}")
+            return jsonify({'message': 'Monitoring stopped', 'area_id': area_id}), 200
+        logger.warning(f"Area ID {area_id} not found for stop_monitoring")
+        return jsonify({'error': 'Area not found'}), 404
+
+    @app.route('/areas', methods=['GET'])
+    def get_areas():
+        areas = MonitoredArea.query.all()
+        area_data = [
+            {
+                'id': area.id,
+                'lamin': area.lamin,
+                'lamax': area.lamax,
+                'lomin': area.lomin,
+                'lomax': area.lomax,
+                'frequency': area.frequency,
+                'is_monitoring': area.is_monitoring
+            }
+            for area in areas
+        ]
+        return jsonify(area_data)
+
+    @app.route('/flight_paths', methods=['GET'])
+    def get_flight_paths():
+        flights = FlightPath.query.all()
+        flight_data = [
+            {
+                'flight_id': flight.flight_id,
+                'points': flight.points_list,
+                'classification': flight.classification,
+                'classification_source': flight.classification_source,
+                'avg_altitude': flight.avg_altitude,
+                'avg_velocity': flight.avg_velocity,
+                'duration': flight.duration
+            }
+            for flight in flights
+        ]
+        return jsonify(flight_data)
+
+    @app.route('/update_classification', methods=['POST'])
+    def update_classification():
+        data = request.get_json()
+        flight_id = data.get('flight_id')
+        classification = data.get('classification')
+        
+        if not flight_id or not classification:
+            return jsonify({'error': 'Missing flight_id or classification'}), 400
+
+        flight = FlightPath.query.filter_by(flight_id=flight_id).first()
+        if flight:
+            flight.classification = classification
+            flight.auto_classified = False
+            flight.classification_source = 'manual'
+            db.session.commit()
+            socketio.emit('flight_update', {
+                'flight_id': flight.flight_id,
+                'points': flight.points_list,
+                'classification': flight.classification,
+                'classification_source': flight.classification_source,
+                'avg_altitude': flight.avg_altitude,
+                'avg_velocity': flight.avg_velocity,
+                'duration': flight.duration
+            })
+            return jsonify({'message': f'Classification updated for {flight_id}'}), 200
+        return jsonify({'error': 'Flight not found'}), 404
+
+    @app.route('/retrain_model', methods=['POST'])
+    def retrain_model_endpoint():
+        success = train_model()
+        if success:
+            return jsonify({'message': 'Model retrained successfully'}), 200
+        return jsonify({'error': 'Failed to retrain model (insufficient data or error)'}), 400
+
+    @app.route('/delete_area', methods=['POST'])
+    def delete_area():
+        data = request.get_json()
+        area_id = data.get('area_id')
+        if not area_id:
+            logger.error("No area_id provided in delete_area request")
+            return jsonify({'error': 'Missing area_id'}), 400
+
+        area = MonitoredArea.query.get(area_id)
+        if area:
+            db.session.delete(area)
+            db.session.commit()
+            logger.info(f"Deleted area ID {area_id}")
+            return jsonify({'message': 'Area deleted', 'area_id': area_id}), 200
+        logger.warning(f"Area ID {area_id} not found for deletion")
+        return jsonify({'error': 'Area not found'}), 404
+
+flight_tracker/ml_model.py
+python
+import pickle
+import os
+from sklearn.ensemble import RandomForestClassifier
+from flight_tracker.utils import logger
+from flight_tracker.models import db, FlightPath
+
+MODEL_PATH = '/data/flight_model.pkl'
+
+def load_model():
+    """Load the saved model from disk."""
+    if os.path.exists(MODEL_PATH):
+        try:
+            with open(MODEL_PATH, 'rb') as f:
+                model = pickle.load(f)
+                logger.info("Model loaded from disk")
+                return model
+        except Exception as e:
+            logger.error(f"Failed to load model: {e}")
+            return None
+    logger.info("No saved model found, returning None")
+    return None
+
+def save_model(model):
+    """Save the model to disk."""
+    try:
+        with open(MODEL_PATH, 'wb') as f:
+            pickle.dump(model, f)
+        logger.info("Model saved to disk")
+    except Exception as e:
+        logger.error(f"Failed to save model: {e}")
+
+def train_model():
+    """Train the model using manual classifications from the database."""
+    # Filter for manually classified flights with valid classifications
+    flights = FlightPath.query.filter_by(auto_classified=False).filter(FlightPath.classification.isnot(None)).all()
+    if len(flights) < 10:
+        logger.warning(f"Insufficient manually classified flights to train model: {len(flights)} found")
+        return False
+
+    X = []
+    y = []
+    for flight in flights:
+        points = flight.points_list
+        if len(points) < 2:
+            continue
+        altitudes = [p[3] for p in points if p[3] != -1]
+        velocities = [p[4] for p in points if p[4] != -1]
+        lat_lons = [(p[0], p[1]) for p in points]
+        turns = 0
+        if len(lat_lons) > 2:
+            for i in range(len(lat_lons) - 2):
+                v1 = (lat_lons[i+1][0] - lat_lons[i][0], lat_lons[i+1][1] - lat_lons[i][1])
+                v2 = (lat_lons[i+2][0] - lat_lons[i+1][0], lat_lons[i+2][1] - lat_lons[i+1][1])
+                dot = v1[0] * v2[0] + v1[1] * v2[1]
+                mag1 = (v1[0]**2 + v1[1]**2)**0.5
+                mag2 = (v2[0]**2 + v2[1]**2)**0.5
+                if mag1 * mag2 > 0:
+                    cos_angle = dot / (mag1 * mag2)
+                    if cos_angle < 0.7:
+                        turns += 1
+        features = [
+            sum(altitudes) / len(altitudes) if altitudes else -1,
+            sum(velocities) / len(velocities) if velocities else -1,
+            turns / len(points) if points else 0
+        ]
+        X.append(features)
+        y.append(flight.classification)
+
+    if len(X) < 2 or len(set(y)) < 2:
+        logger.warning(f"Insufficient data variety to train model: {len(X)} samples, {len(set(y))} unique classes")
+        return False
+
+    model = RandomForestClassifier(n_estimators=100, random_state=42)
+    if model.fit(X, y):
+        save_model(model)
+        logger.info("Model trained successfully with %d samples and %d classes", len(X), len(set(y)))
+        return True
+    return False
+
+flight_tracker/static/js/map_init.js
+javascript
+
+const map = L.map('map', {
+    zoomControl: false,
+    renderer: L.canvas() // Use canvas renderer for the map
+}).setView([56.0, 11.0], 6);
+
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19,
+}).addTo(map);
+
+const flightLayer = L.markerClusterGroup({
+    maxClusterRadius: 50,
+    disableClusteringAtZoom: 15,
+    chunkedLoading: true // Improve loading performance for many markers
+}).addTo(map);
+
+let hasZoomed = false;
+
+function initMap() {
+    console.log('Initializing map and flightLayer');
+    fetch('/areas')
+        .then(response => response.json())
+        .then(data => {
+            data.forEach(area => {
+                const bounds = L.latLngBounds([area.lamin, area.lomin], [area.lamax, area.lomax]);
+                addArea(bounds, area.is_monitoring, area.id, area.frequency);
+            });
+        })
+        .catch(error => console.error('Error loading areas:', error));
+
+    map.on('mousedown', onMouseDown);
+    map.on('mousemove', onMouseMove);
+    map.on('mouseup', onMouseUp);
+    map.on('click', onMapClick);
+}
+
+flight_tracker/static/js/area_manager.js
+javascript
+
+let areas = [];
+let drawing = false;
+let startLatLng = null;
+let currentRectangle = null;
+let selectedArea = null;
+
+function onMouseDown(e) {
+    if (e.originalEvent.shiftKey) {
+        drawing = true;
+        startLatLng = e.latlng;
+        currentRectangle = L.rectangle([[startLatLng.lat, startLatLng.lng], [startLatLng.lat, startLatLng.lng]], {
+            color: '#808080',
+            weight: 2,
+            dashArray: '5, 5',
+            fillOpacity: 0
+        }).addTo(map);
+    }
+}
+
+function onMouseMove(e) {
+    if (drawing && currentRectangle) {
+        const bounds = L.latLngBounds(startLatLng, e.latlng);
+        currentRectangle.setBounds(bounds);
+    }
+}
+
+function onMouseUp(e) {
+    if (drawing && currentRectangle) {
+        drawing = false;
+        const bounds = currentRectangle.getBounds();
+        const frequency = document.getElementById('frequency').value;
+        persistArea(bounds, false, frequency);
+        map.removeLayer(currentRectangle);
+        currentRectangle = null;
+    }
+}
+
+function onMapClick(e) {
+    const clickedOnArea = areas.some(area => area.rectangle.getBounds().contains(e.latlng));
+    if (!clickedOnArea && !e.originalEvent.shiftKey) {
+        console.log('Clicked outside, deselecting area');
+        deselectArea();
+        deselectFlight();
+    }
+}
+
+function persistArea(bounds, isMonitoring, frequency) {
+    fetch('/start_monitoring', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            lamin: bounds.getSouth(),
+            lamax: bounds.getNorth(),
+            lomin: bounds.getWest(),
+            lomax: bounds.getEast(),
+            frequency: frequency
+        })
+    })
+        .then(response => response.json())
+        .then(data => {
+            if (data.error) {
+                console.error(data.error);
+            } else {
+                addArea(bounds, isMonitoring, data.area_id, frequency);
+                appendLog(`Area created with ID ${data.area_id}`);
+            }
+        });
+}
+
+function addArea(bounds, isMonitoring, id, frequency) {
+    const style = isMonitoring ?
+        { color: '#006400', weight: 2, dashArray: '5, 5', fillOpacity: 0 } :
+        { color: '#808080', weight: 2, dashArray: '5, 5', fillOpacity: 0 };
+    const rectangle = L.rectangle(bounds, style).addTo(map);
+    const area = { rectangle, bounds, isMonitoring, id, frequency };
+    rectangle.on('click', (e) => {
+        L.DomEvent.stopPropagation(e);
+        console.log(`Area clicked, selecting: ${JSON.stringify(bounds)}`);
+        selectArea(area);
+    });
+    areas.push(area);
+    updateStats();
+    updateMonitorButton();
+}
+
+function selectArea(area) {
+    if (selectedArea && selectedArea !== area) {
+        console.log(`Deselecting previous area: ${JSON.stringify(selectedArea.bounds)}`);
+        updateAreaStyle(selectedArea);
+    }
+    selectedArea = area;
+    console.log(`Selecting new area: ${JSON.stringify(area.bounds)}`);
+    updateAreaStyle(area);
+    updateMonitorButton();
+    document.getElementById('delete-btn').disabled = false;
+}
+
+function deselectArea() {
+    if (selectedArea) {
+        console.log(`Deselecting area: ${JSON.stringify(selectedArea.bounds)}`);
+        updateAreaStyle(selectedArea);
+        selectedArea = null;
+        updateMonitorButton();
+        document.getElementById('delete-btn').disabled = true;
+    }
+}
+
+function updateAreaStyle(area) {
+    const fillOpacity = (area === selectedArea) ? 0.05 : 0;
+    const fillColor = '#00ff00';
+    console.log(`Updating style for area: ${JSON.stringify(area.bounds)}, selected: ${area === selectedArea}, fillOpacity: ${fillOpacity}`);
+    area.rectangle.setStyle({
+        color: area.is_monitoring ? '#006400' : '#808080',
+        fillOpacity: fillOpacity,
+        fillColor: fillColor
+    });
+}
+
+flight_tracker/static/js/flight_renderer.js
+javascript
+
+let flightLines = new Set();
+let selectedFlightId = null;
+
+const airplaneSvg = `
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <path d="M20.5 3.5L3.5 12L9.5 14.5L15.5 9.5L10.5 15.5L13 20.5L20.5 3.5Z" fill="#333" stroke="#333" stroke-width="2"/>
+    </svg>
+`;
+
+function calculateBearing(lat1, lon1, lat2, lon2) {
+    const dLon = (lon2 - lon1) * Math.PI / 180;
+    const y = Math.sin(dLon) * Math.cos(lat2 * Math.PI / 180);
+    const x = Math.cos(lat1 * Math.PI / 180) * Math.sin(lat2 * Math.PI / 180) -
+        Math.sin(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.cos(dLon);
+    const bearing = Math.atan2(y, x);
+    return (bearing * 180 / Math.PI + 360) % 360;
+}
+
+function shouldRenderPath(flight) {
+    const checkbox = document.getElementById(`show-${flight.classification || 'N/A'}`);
+    return flight.flight_id === selectedFlightId || (checkbox && checkbox.checked);
+}
+
+function renderFlightPath(flight) {
+    if (!flight || !flight.flight_id) {
+        console.warn('Invalid flight data, skipping render');
+        return;
+    }
+
+    //console.log('Rendering flight:', flight);
+    const sortedPoints = flight.points.slice().sort((a, b) => a[2] - b[2]);
+    let coords;
+    const isSelected = flight.flight_id === selectedFlightId;
+    const totalPaths = Object.keys(flightLines).length;
+    const useFullPoints = isSelected || totalPaths < 200;
+
+    if (typeof simplify !== 'undefined' && !useFullPoints) {
+        const simplifiedPoints = simplify(sortedPoints.map(p => ({ x: p[1], y: p[0], t: p[2], alt: p[3], vel: p[4] })), 0.1, true);
+        coords = simplifiedPoints.map(p => [p.y, p.x]);
+    } else {
+        coords = sortedPoints.map(p => [p[0], p[1]]);
+    }
+
+    const flightData = flightLines[flight.flight_id] || {};
+    flightLines[flight.flight_id] = flightData;
+    flightData.points = sortedPoints;
+    flightData.classification = flight.classification;
+    flightData.classification_source = flight.classification_source;
+    flightData.avg_altitude = flight.avg_altitude;
+    flightData.avg_velocity = flight.avg_velocity;
+    flightData.duration = flight.duration;
+
+    const color = flight.classification === 'commercial' ? '#00ff00' :
+        flight.classification === 'survey' ? '#ff0000' :
+            flight.classification === 'agriculture' ? '#FFA500' :
+                flight.classification === 'cloud seeding' ? '#0000FF' :
+                    flight.classification === 'crop dusting' ? '#FF00FF' :
+                        flight.classification === 'rescue' ? '#FFFF00' :
+                            flight.classification === 'chemtrail' ? '#800080' : '#808080';
+    const opacity = isSelected ? 1 : (selectedFlightId ? 0.1 : 0.6);
+    let rotation = 0;
+
+    // Pattern detection for visualization
+    let patternStyle = { dashArray: null };
+    if (flight.classification === 'cloud seeding' && isSelected) {
+        patternStyle.dashArray = '10, 5'; // Grid-like
+    } else if (flight.classification === 'crop dusting' && isSelected) {
+        patternStyle.dashArray = '5, 10, 5'; // Zig-zag
+    } else if (flight.classification === 'rescue' && isSelected) {
+        patternStyle.dashArray = '15, 5'; // Circular
+    }
+
+    if (coords.length >= 1) {
+        const lastPoint = sortedPoints[sortedPoints.length - 1];
+        const altitude = lastPoint[3] === -1 ? 'N/A' : `${lastPoint[3]} m`;
+        const velocity = lastPoint[4] === -1 ? 'N/A' : `${lastPoint[4]} m/s`;
+        const avgAltitude = flight.avg_altitude === -1 ? 'N/A' : `${Math.round(flight.avg_altitude)} m`;
+        const avgVelocity = flight.avg_velocity === -1 ? 'N/A' : `${Math.round(flight.avg_velocity)} m/s`;
+        const duration = flight.duration === 0 ? 'N/A' : `${Math.round(flight.duration / 60)} min`;
+        const popupContent = `Flight: ${flight.flight_id}<br>Class: ${flight.classification || 'N/A'} (${flight.classification_source || 'N/A'})<br>Altitude: ${altitude}<br>Velocity: ${velocity}<br>Avg Altitude: ${avgAltitude}<br>Avg Velocity: ${avgVelocity}<br>Duration: ${duration}`;
+
+        if (coords.length > 1) {
+            const validCoords = coords.filter(([lat, lon]) => lat !== null && lon !== null && !isNaN(lat) && !isNaN(lon));
+            const lastPoints = validCoords.slice(-3);
+            if (lastPoints.length >= 2) {
+                const [lat2, lon2] = lastPoints[lastPoints.length - 1];
+                const [lat1, lon1] = lastPoints[lastPoints.length - 2];
+                rotation = calculateBearing(lat1, lon1, lat2, lon2) - 45;
+                flightData.lastRotation = rotation;
+            } else {
+                rotation = flightData.lastRotation || 0;
+            }
+
+            if (shouldRenderPath(flight)) {
+                if (validCoords.length > 1) {
+                    try {
+                        if (flightData.line) {
+                            flightData.line.setLatLngs(validCoords);
+                        } else {
+                            flightData.line = L.polyline(validCoords, {
+                                color: color,
+                                weight: 4,
+                                opacity: opacity,
+                                dashArray: patternStyle.dashArray
+                            });
+                            flightData.line.addTo(flightLayer);
+                            flightData.line.on('dblclick', () => selectFlight(flight.flight_id));
+                        }
+                        flightData.line.bindPopup(popupContent);
+                        flightData.line.setStyle({ opacity: opacity, dashArray: patternStyle.dashArray });
+                    } catch (e) {
+                        console.error(`Failed to render polyline for ${flight.flight_id}:`, e);
+                        delete flightData.line;
+                    }
+                } else {
+                    console.warn(`Insufficient valid coordinates for polyline in ${flight.flight_id}:`, validCoords);
+                    if (flightData.line) {
+                        flightLayer.removeLayer(flightData.line);
+                        delete flightData.line;
+                    }
+                }
+            } else if (flightData.line) {
+                flightLayer.removeLayer(flightData.line);
+                delete flightData.line;
+            }
+        }
+
+        const airplaneIcon = L.divIcon({
+            html: `<div style="transform: rotate(${rotation}deg);">${airplaneSvg}</div>`,
+            className: 'airplane-icon',
+            iconSize: [20, 20],
+            iconAnchor: [10, 10]
+        });
+
+        if (flightData.marker) {
+            flightData.marker.setLatLng(coords[coords.length - 1]);
+            flightData.marker.setIcon(airplaneIcon);
+            flightData.marker.setOpacity(opacity);
+        } else {
+            flightData.marker = L.marker(coords[coords.length - 1], { icon: airplaneIcon })
+                .bindPopup(popupContent)
+                .addTo(flightLayer);
+            flightData.marker.on('dblclick', () => selectFlight(flight.flight_id));
+            flightData.marker.setOpacity(opacity);
+        }
+    } else {
+        console.warn(`No valid coordinates for flight ${flight.flight_id}`);
+    }
+}
+
+const debouncedRenderFlightPath = debounce(renderFlightPath, 100);
+window.debouncedRenderFlightPath = renderFlightPath;
+
+
+function selectFlight(flightId) {
+    if (!flightId || !flightLines[flightId]) {
+        console.warn(`Cannot select flight ${flightId}: not found in flightLines`);
+        return;
+    }
+
+    selectedFlightId = flightId;
+    const selectedFlightData = flightLines[flightId];
+
+    // Immediately render the selected flight’s path with full points
+    renderFlightPath(selectedFlightData);
+
+    // Update opacity for all other flights
+    Object.keys(flightLines).forEach(id => {
+        if (id !== flightId) {
+            const flightData = flightLines[id];
+            const opacity = 0.1; // Dim unselected flights
+            if (flightData.line) {
+                if (shouldRenderPath(flightData) && id !== selectedFlightId) {
+                    flightData.line.setStyle({ opacity: opacity });
+                } else if (!shouldRenderPath(flightData)) {
+                    flightLayer.removeLayer(flightData.line);
+                    delete flightData.line;
+                }
+            }
+            if (flightData.marker) {
+                flightData.marker.setOpacity(opacity);
+            }
+        }
+    });
+
+    // Zoom to the selected flight without forcing a cluster redraw
+    if (selectedFlightData.line) {
+        map.fitBounds(selectedFlightData.line.getBounds(), { maxZoom: 15 });
+    } else if (selectedFlightData.marker) {
+        map.setView(selectedFlightData.marker.getLatLng(), Math.min(map.getZoom(), 15));
+    }
+
+    updateFlightList(); // Update list without fetch
+}
+
+function deselectFlight() {
+    selectedFlightId = null;
+
+    // Update all flights immediately
+    Object.keys(flightLines).forEach(id => {
+        const flightData = flightLines[id];
+        const opacity = 0.6; // All shown mode
+        const shouldRender = document.getElementById(`show-${flightData.classification || 'N/A'}`)?.checked;
+        if (flightData.line) {
+            if (shouldRender) {
+                flightData.line.setStyle({ opacity: opacity });
+            } else {
+                flightLayer.removeLayer(flightData.line);
+                delete flightData.line;
+            }
+        } else if (shouldRender) {
+            renderFlightPath(flightData); // Draw path if it should be visible
+        }
+        if (flightData.marker) {
+            flightData.marker.setOpacity(opacity);
+        }
+    });
+
+    updateFlightList(); // Update list without fetch
+}
+
+flight_tracker/static/js/utils.js
+javascript
+
+let canRetrain = false;
+let updateTimeout = null;
+
+function debounce(func, wait) {
+    let timeout;
+    return function (...args) {
+        clearTimeout(timeout);
+        timeout = setTimeout(() => func.apply(this, args), wait);
+    };
+}
+
+function appendLog(message) {
+    const log = document.getElementById('log');
+    log.innerText = message + '\n' + log.innerText;
+    log.scrollTop = 0;
+}
+
+function debounceUpdateFlightPaths() {
+    clearTimeout(updateTimeout);
+    updateTimeout = setTimeout(updateFlightPaths, 500);
+}
+
+function getSelectedClasses() {
+    return Array.from(document.querySelectorAll('.path-checkboxes input[type="checkbox"]:checked'))
+        .map(cb => cb.id.replace('show-', ''));
+}
+
+function updateFlightPaths() {
+    fetch('/flight_paths')
+        .then(response => response.json())
+        .then(data => {
+            console.log('Fetched flight paths:', data);
+            const activeFlightIds = new Set(data.map(f => f.flight_id));
+            Object.keys(flightLines).forEach(id => {
+                if (!activeFlightIds.has(id)) {
+                    if (flightLines[id].line) flightLayer.removeLayer(flightLines[id].line);
+                    if (flightLines[id].marker) flightLayer.removeLayer(flightLines[id].marker);
+                    delete flightLines[id];
+                }
+            });
+            data.forEach(flight => debouncedRenderFlightPath(flight));
+            updateFlightList();
+            updateStats();
+            fetch('/flight_paths').then(r => r.json()).then(data => {
+                const classCounts = data.reduce((acc, f) => {
+                    acc[f.classification] = (acc[f.classification] || 0) + 1;
+                    return acc;
+                }, {});
+                canRetrain = Object.keys(classCounts).length > 1 && data.length >= 10;
+                document.getElementById('retrain-btn').disabled = !canRetrain;
+            });
+            document.querySelectorAll('.path-checkboxes input[type="checkbox"]').forEach(cb => {
+                Cookies.set(cb.id, cb.checked, { expires: 365 });
+            });
+        })
+        .catch(error => console.error('Error fetching paths:', error));
+}
+
+function updateFlightList() {
+    const list = document.getElementById('flight-list-content');
+    list.innerHTML = '';
+    console.log('Updating flight list with flightLines:', Object.keys(flightLines));
+    const selectedClasses = getSelectedClasses();
+
+    Object.keys(flightLines).forEach(id => {
+        const flight = flightLines[id];
+        const popupContent = flight.line?.getPopup()?.getContent() || flight.marker?.getPopup()?.getContent() || '';
+        const currentClass = popupContent.match(/Class: (.*?)(?:\s\(|$)/)?.[1] || 'N/A';
+        const source = popupContent.match(/\((.*?)\)/)?.[1] || 'N/A';
+        const lastPoint = flight.points[flight.points.length - 1];
+        const altitude = lastPoint[3] === -1 ? 'N/A' : `${lastPoint[3]} m`;
+        const velocity = lastPoint[4] === -1 ? 'N/A' : `${lastPoint[4]} m/s`;
+        const avgAltitude = flight.avg_altitude === -1 ? 'N/A' : `${Math.round(flight.avg_altitude)} m`;
+        const avgVelocity = flight.avg_velocity === -1 ? 'N/A' : `${Math.round(flight.avg_velocity)} m/s`;
+        const duration = flight.duration === 0 ? 'N/A' : `${Math.round(flight.duration / 60)} min`;
+        const heading = flight.line ? (flight.line.getLatLngs().length > 1 ? flight.lastRotation || 'N/A' : 'N/A') : 'N/A';
+
+        // Show flight if its class is selected, no classes are selected, or it’s the selected flight
+        const shouldShow = selectedClasses.length === 0 || selectedClasses.includes(currentClass) || id === selectedFlightId;
+        if (shouldShow) {
+            const div = document.createElement('div');
+            if (id === selectedFlightId) {
+                div.className = 'flight-item detailed';
+                div.innerHTML = `
+                    <div class="flight-header">
+                        <svg class="icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#e0e0e0" stroke-width="2">
+                            <path d="M20.5 3.5L3.5 12L9.5 14.5L15.5 9.5L10.5 15.5L13 20.5L20.5 3.5Z"/>
+                        </svg>
+                        <span>${id}</span>
+                    </div>
+                    <div class="flight-data">
+                        <div><svg class="icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#e0e0e0" stroke-width="2"><path d="M12 2v20m10-10H2"/></svg><span>Alt: ${altitude}</span></div>
+                        <div><svg class="icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#e0e0e0" stroke-width="2"><path d="M22 11h-8l-2-9L2 12l10 10 2-9h8z"/></svg><span>Vel: ${velocity}</span></div>
+                        <div><svg class="icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#e0e0e0" stroke-width="2"><path d="M12 2v10l8 4-8-14zm0 20v-6"/></svg><span>Heading: ${heading === 'N/A' ? 'N/A' : `${Math.round(heading)}°`}</span></div>
+                        <div><svg class="icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#e0e0e0" stroke-width="2"><path d="M12 2v20m10-10H2"/></svg><span>Avg Alt: ${avgAltitude}</span></div>
+                        <div><svg class="icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#e0e0e0" stroke-width="2"><path d="M22 11h-8l-2-9L2 12l10 10 2-9h8z"/></svg><span>Avg Vel: ${avgVelocity}</span></div>
+                        <div><svg class="icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#e0e0e0" stroke-width="2"><path d="M12 2v6m0 10v6m-6-12h12"/></svg><span>Duration: ${duration}</span></div>
+                    </div>
+                    <select onchange="updateClassification('${id}', this.value)">
+                        ${Array.from(document.getElementById('class-filter').options).map(opt =>
+                    `<option value="${opt.value}" ${currentClass === opt.value ? 'selected' : ''}>${opt.value || 'N/A'}</option>`
+                ).join('')}
+                    </select>
+                    <span class="source">(${source})</span>
+                `;
+            } else {
+                div.className = 'flight-item compact';
+                div.innerHTML = `
+                    <svg class="icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#e0e0e0" stroke-width="2">
+                        <path d="M20.5 3.5L3.5 12L9.5 14.5L15.5 9.5L10.5 15.5L13 20.5L20.5 3.5Z"/>
+                    </svg>
+                    <span>${id} - ${currentClass}</span>
+                `;
+            }
+            div.dataset.classification = currentClass;
+            div.style.backgroundColor = id === selectedFlightId ? '#3c3c3c' : '';
+            div.onclick = () => selectFlight(id);
+            div.tabIndex = 0;
+            list.appendChild(div);
+        }
+    });
+    filterFlights();
+
+    list.addEventListener('keydown', (e) => {
+        const items = Array.from(list.children).filter(item => item.style.display !== 'none');
+        if (!items.length) return;
+        const focused = document.activeElement;
+        const index = items.indexOf(focused);
+
+        if (e.key === 'ArrowDown' && index < items.length - 1) {
+            e.preventDefault();
+            items[index + 1].focus();
+            selectFlight(items[index + 1].querySelector('span').textContent.split(' - ')[0]);
+        } else if (e.key === 'ArrowUp' && index > 0) {
+            e.preventDefault();
+            items[index - 1].focus();
+            selectFlight(items[index - 1].querySelector('span').textContent.split(' - ')[0]);
+        }
+    });
+}
+
+function updateStats() {
+    document.getElementById('flight-count').innerText = Object.keys(flightLines).length;
+    document.getElementById('area-count').innerText = areas.filter(a => a.is_monitoring).length;
+    console.log('Total flights tracked:', flightLines.size);
+}
+
+function updateClassification(flightId, classification) {
+    fetch('/update_classification', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ flight_id: flightId, classification: classification })
+    })
+        .then(response => response.json())
+        .then(data => {
+            if (data.error) {
+                console.error(data.error);
+            } else {
+                appendLog(data.message);
+                debounceUpdateFlightPaths();
+            }
+        })
+        .catch(error => console.error('Error:', error));
+}
+
+function filterFlights() {
+    const textFilter = document.getElementById('flight-filter').value.toLowerCase();
+    const classFilter = document.getElementById('class-filter').value;
+    const selectedClasses = getSelectedClasses();
+    const list = document.getElementById('flight-list-content');
+    Array.from(list.children).forEach(div => {
+        const text = div.textContent.toLowerCase();
+        const classification = div.dataset.classification || 'N/A';
+        const flightId = div.querySelector('span').textContent.split(' - ')[0];
+        const matchesText = text.includes(textFilter);
+        const matchesClass = !classFilter || classification === classFilter;
+        const matchesPathSelection = selectedClasses.length === 0 || selectedClasses.includes(classification) || flightId === selectedFlightId;
+        div.style.display = matchesText && matchesClass && matchesPathSelection ? '' : 'none';
+    });
+}
+
+flight_tracker/static/js/controls.js
+javascript
+
+function toggleMonitoring() {
+    if (!selectedArea) return;
+    const frequency = document.getElementById('frequency').value;
+    const bounds = selectedArea.bounds;
+    if (selectedArea.isMonitoring) {
+        console.log(`Stopping monitoring for area_id: ${selectedArea.id}`);
+        fetch('/stop_monitoring', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ area_id: selectedArea.id })
+        })
+            .then(response => {
+                console.log(`Stop monitoring response status: ${response.status}`);
+                return response.json();
+            })
+            .then(data => {
+                if (data.error) {
+                    console.error(`Error stopping monitoring: ${data.error}`);
+                    appendLog(`Error: ${data.error}`);
+                } else {
+                    selectedArea.isMonitoring = false;
+                    updateAreaStyle(selectedArea);
+                    appendLog(`Monitoring stopped for area ${data.area_id}`);
+                    console.log(`Monitoring stopped successfully for area_id: ${data.area_id}`);
+                    updateStats();
+                    updateMonitorButton();
+                }
+            })
+            .catch(error => console.error('Fetch error:', error));
+    } else {
+        console.log(`Starting monitoring for area: ${JSON.stringify(bounds)}`);
+        fetch('/start_monitoring', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                lamin: bounds.getSouth(),
+                lamax: bounds.getNorth(),
+                lomin: bounds.getWest(),
+                lomax: bounds.getEast(),
+                frequency: frequency
+            })
+        })
+            .then(response => response.json())
+            .then(data => {
+                if (data.error) {
+                    console.error(data.error);
+                } else {
+                    selectedArea.isMonitoring = true;
+                    selectedArea.id = data.area_id;
+                    selectedArea.frequency = frequency;
+                    updateAreaStyle(selectedArea);
+                    appendLog(`Monitoring started for area ${data.area_id}`);
+                    console.log(`Monitoring started successfully for area_id: ${data.area_id}`);
+                    updateStats();
+                    updateMonitorButton();
+                }
+            });
+    }
+}
+
+function deleteArea() {
+    if (!selectedArea) return;
+    if (selectedArea.isMonitoring) {
+        console.log(`Deleting area, stopping monitoring for area_id: ${selectedArea.id}`);
+        fetch('/stop_monitoring', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ area_id: selectedArea.id })
+        })
+            .then(response => response.json())
+            .then(data => {
+                if (!data.error) {
+                    appendLog(`Monitoring stopped for area ${data.area_id}`);
+                    console.log(`Monitoring stopped during delete for area_id: ${data.area_id}`);
+                }
+            });
+    }
+    fetch('/delete_area', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ area_id: selectedArea.id })
+    })
+        .then(response => response.json())
+        .then(data => {
+            if (!data.error) {
+                map.removeLayer(selectedArea.rectangle);
+                areas = areas.filter(a => a !== selectedArea);
+                selectedArea = null;
+                updateStats();
+                updateMonitorButton();
+                appendLog(`Area ${data.area_id} deleted`);
+            }
+        });
+}
+
+function retrainModel() {
+    if (!canRetrain) return;
+    fetch('/retrain_model', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({})
+    })
+        .then(response => response.json())
+        .then(data => {
+            if (data.error) {
+                console.error(data.error);
+                appendLog(`Error: ${data.error}`);
+            } else {
+                appendLog(data.message);
+            }
+        })
+        .catch(error => console.error('Error:', error));
+}
+
+function updateMonitorButton() {
+    const monitorBtn = document.getElementById('monitor-btn');
+    if (selectedArea) {
+        monitorBtn.textContent = selectedArea.isMonitoring ? 'Stop Monitoring' : 'Start Monitoring';
+        monitorBtn.disabled = false;
+    } else {
+        monitorBtn.textContent = 'Start Monitoring';
+        monitorBtn.disabled = true;
+        document.getElementById('delete-btn').disabled = true;
+    }
+}
+
+function filterFlights() {
+    const filter = document.getElementById('flight-filter').value.toLowerCase();
+    const list = document.getElementById('flight-list-content');
+    Array.from(list.children).forEach(div => {
+        const text = div.textContent.toLowerCase();
+        div.style.display = text.includes(filter) ? '' : 'none';
+    });
+}
+
+flight_tracker/static/js/socket.js
+javascript
+
+const socket = io();
+
+function setupSocketEvents(map) {
+    if (!map) {
+        console.error('Map not initialized for socket events');
+        return;
+    }
+
+    socket.on('log', (data) => {
+        appendLog(data.message);
+    });
+
+    socket.on('flight_batch_update', (data) => {
+        let allCoords = [];
+        data.flights.forEach(flight => {
+            flightLines.add(flight.flight_id);
+            window.debouncedRenderFlightPath(flight);
+            allCoords = allCoords.concat(flight.points.map(p => [p[0], p[1]]));
+        });
+        if (map.fitBounds != undefined && allCoords.length > 0 && !hasZoomed) {
+            map.fitBounds(allCoords);
+            hasZoomed = true;
+        }
+        updateFlightList();
+        updateStats();
+    });
+
+    socket.on('connect', () => {
+        console.log('Connected to server');
+        fetch('/get_flight_paths')
+            .then(response => response.json())
+            .then(data => {
+                console.log('Fetched flight paths:', data);
+                data.forEach(flight => flightLines.add(flight.flight_id));
+                updateFlightList();
+            })
+            .catch(err => console.error('Error fetching flight paths:', err));
+    });
+
+    socket.on('flight_cleanup', (data) => {
+        data.flight_ids.forEach(id => flightLines.delete(id));
+        console.log('Cleaned up flights, new flightLines:', Array.from(flightLines));
+        updateFlightList();
+    });
+
+    socket.on('disconnect', () => console.log('Disconnected from server'));
+    socket.on('error', (err) => console.error('WebSocket error:', err));
+}
+
+flight_tracker/static/index.html
+html
+
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>Flight Tracker Dashboard</title>
+    <link rel="stylesheet" href="/static/css/base.css">
+    <link rel="stylesheet" href="/static/css/top-bar.css">
+    <link rel="stylesheet" href="/static/css/map.css">
+    <link rel="stylesheet" href="/static/css/controls.css">
+    <link rel="stylesheet" href="/static/css/flight-list.css">
+    <link rel="stylesheet" href="/static/css/log.css">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+    <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
+    <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.4/css/all.min.css"
+        integrity="sha512-1ycn6IcaQQ40/MKBW2W4Rhis/DbILU74C1vSrLJxCq57o941Ym01SwNsOMqvEBFlcgUa6xLiPY/NS5R+E6ztJQ=="
+        crossorigin="anonymous" referrerpolicy="no-referrer" />
+</head>
+
+<body>
+    <div class="dashboard">
+        <header class="top-bar">
+            <h1>Flight Tracker</h1>
+            <div class="stats">
+                <span>Tracked Flights: <span id="flight-count">0</span></span>
+                <span>Active Areas: <span id="area-count">0</span></span>
+            </div>
+        </header>
+        <div class="main-content">
+            <div class="map-container">
+                <div id="map"></div>
+                <div class="legend" id="map-legend">
+                    <div><span style="color: #808080;">⋯</span> Disabled Area</div>
+                    <div><span style="color: #006400;">⋯</span> Monitored Area</div>
+                    <div><span style="color: #00ff00;">■</span> Commercial</div>
+                    <div><span style="color: #ff0000;">■</span> Survey</div>
+                    <div><span style="color: #FFA500;">■</span> Agriculture</div>
+                    <div><span style="color: #0000FF;">■</span> Cloud Seeding</div>
+                    <div><span style="color: #FF00FF;">■</span> Crop Dusting</div>
+                    <div><span style="color: #FFFF00;">■</span> Rescue</div>
+                    <div><span style="color: #800080;">■</span> Chemtrail</div>
+                </div>
+            </div>
+            <aside class="sidebar">
+                <div class="controls">
+                    <h2>Controls</h2>
+                    <div class="control-row">
+                        <select id="frequency" title="Set refresh frequency">
+                            <option value="30s">30s</option>
+                            <option value="1m">1m</option>
+                            <option value="5m">5m</option>
+                        </select>
+                        <button id="monitor-btn" title="Toggle monitoring"><i class="fas fa-play"></i></button>
+                        <button id="delete-btn" title="Delete selected area" disabled><i
+                                class="fas fa-trash"></i></button>
+                        <button id="retrain-btn" title="Retrain ML model" disabled><i
+                                class="fas fa-sync-alt"></i></button>
+                    </div>
+                    <h3>Show Paths</h3>
+                    <div class="path-checkboxes">
+                        <label><input type="checkbox" id="show-commercial" onchange="updatePathsAndList()">
+                            Commercial</label>
+                        <label><input type="checkbox" id="show-survey" onchange="updatePathsAndList()"> Survey</label>
+                        <label><input type="checkbox" id="show-agriculture" onchange="updatePathsAndList()">
+                            Agriculture</label>
+                        <label><input type="checkbox" id="show-cloud-seeding" onchange="updatePathsAndList()"> Cloud
+                            Seeding</label>
+                        <label><input type="checkbox" id="show-crop-dusting" onchange="updatePathsAndList()"> Crop
+                            Dusting</label>
+                        <label><input type="checkbox" id="show-rescue" onchange="updatePathsAndList()"> Rescue</label>
+                        <label><input type="checkbox" id="show-chemtrail" onchange="updatePathsAndList()">
+                            Chemtrail</label>
+                    </div>
+                    <div class="add-class">
+                        <input type="text" id="new-class" placeholder="New classification">
+                        <button id="add-class-btn" title="Add new classification"><i class="fas fa-plus"></i></button>
+                    </div>
+                </div>
+                <div class="flight-list">
+                    <h2>Active Flights</h2>
+                    <input type="text" id="flight-filter" placeholder="Filter flights..." onkeyup="filterFlights()">
+                    <select id="class-filter" onchange="filterFlights()">
+                        <option value="">All Classifications</option>
+                        <option value="commercial">Commercial</option>
+                        <option value="survey">Survey</option>
+                        <option value="agriculture">Agriculture</option>
+                        <option value="cloud seeding">Cloud Seeding</option>
+                        <option value="crop dusting">Crop Dusting</option>
+                        <option value="rescue">Rescue</option>
+                        <option value="chemtrail">Chemtrail</option>
+                    </select>
+                    <div id="flight-list-content" class="flight-list-scroll"></div>
+                </div>
+            </aside>
+        </div>
+        <footer class="log-container">
+            <h2>Logs</h2>
+            <pre id="log"></pre>
+        </footer>
+    </div>
+    <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+    <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
+    <script src="/static/js/simplify.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.5.1/socket.io.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/js-cookie@3.0.5/dist/js.cookie.min.js"></script>
+    <script src="/static/js/utils.js"></script>
+    <script src="/static/js/map_init.js"></script>
+    <script src="/static/js/area_manager.js"></script>
+    <script src="/static/js/flight_renderer.js"></script>
+    <script src="/static/js/controls.js"></script>
+    <script src="/static/js/socket.js"></script>
+    <script>
+        function addClassification() {
+            const input = document.getElementById('new-class');
+            const newClass = input.value.trim();
+            if (newClass && !Array.from(document.querySelectorAll('.path-checkboxes input')).some(cb => cb.id === `show-${newClass}`)) {
+                const checkbox = document.createElement('label');
+                checkbox.innerHTML = `<input type="checkbox" id="show-${newClass}" onchange="updatePathsAndList()"> ${newClass}`;
+                document.querySelector('.path-checkboxes').appendChild(checkbox);
+                document.getElementById('class-filter').add(new Option(newClass, newClass));
+                Cookies.set(`show-${newClass}`, 'false');
+                input.value = '';
+                updatePathsAndList();
+            }
+        }
+
+        function updatePathsAndList() {
+            updateFlightPaths();
+            filterFlights();
+            document.querySelectorAll('.path-checkboxes input[type="checkbox"]').forEach(cb => {
+                Cookies.set(cb.id, cb.checked, { expires: 365 });
+            });
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            initMap();
+            setupSocketEvents();
+            const frequency = Cookies.get('frequency') || '30s';
+            document.getElementById('frequency').value = frequency;
+            ['commercial', 'survey', 'agriculture', 'cloud-seeding'].forEach(cls => {
+                const checkbox = document.getElementById(`show-${cls}`);
+                if (checkbox) checkbox.checked = Cookies.get(`show-${cls}`) === 'true';
+            });
+            updatePathsAndList();
+            setInterval(updateFlightPaths, 10000);
+
+            document.getElementById('frequency').addEventListener('change', (e) => {
+                Cookies.set('frequency', e.target.value, { expires: 365 });
+            });
+
+            map.on('click', (e) => {
+                const clickedOnFlight = Object.values(flightLines).some(fd =>
+                    (fd.marker && fd.marker.getLatLng().equals(e.latlng)) ||
+                    (fd.line && fd.line.getBounds().contains(e.latlng))
+                );
+                if (!clickedOnFlight && !areas.some(a => a.rectangle.getBounds().contains(e.latlng))) {
+                    deselectFlight();
+                }
+            });
+
+            // Bind button events
+            document.getElementById('monitor-btn').addEventListener('click', toggleMonitoring);
+            document.getElementById('delete-btn').addEventListener('click', deleteArea);
+            document.getElementById('retrain-btn').addEventListener('click', retrainModel);
+            document.getElementById('add-class-btn').addEventListener('click', addClassification);
+        });
+    </script>
+</body>
+
+</html>
+
+CSS Files
+flight_tracker/static/css/base.css:
+css
+
+body {
+    background: #1e1e1e;
+    color: #e0e0e0;
+    font-family: 'Segoe UI', Arial, sans-serif;
+    margin: 0;
+    padding: 0;
+}
+
+.dashboard {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+}
+
+.main-content {
+    display: flex;
+    flex: 1;
+    padding: 20px;
+    gap: 20px;
+    overflow: hidden;
+}
+
+.sidebar {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+    max-height: 100%;
+    overflow: hidden;
+}
+
+flight_tracker/static/css/top-bar.css:
+
+css
+
+.top-bar {
+    background: #2d2d2d;
+    padding: 15px 20px;
+    border-bottom: 1px solid #444;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
+    border-radius: 0 0 10px 10px;
+}
+
+.top-bar h1 {
+    margin: 0;
+    font-size: 24px;
+    color: #1a73e8;
+}
+
+.stats span {
+    margin-left: 20px;
+    font-weight: 500;
+    color: #b0b0b0;
+}
+
+flight_tracker/static/css/map.css:
+
+css
+
+.map-container {
+    flex: 2;
+    background: #252525;
+    border-radius: 10px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+    position: relative;
+    overflow: hidden;
+}
+
+#map {
+    height: 100%;
+    width: 100%;
+    border-radius: 10px;
+}
+
+.legend {
+    position: absolute;
+    top: 10px;
+    right: 10px;
+    background: rgba(45, 45, 45, 0.9);
+    padding: 5px 10px;
+    border-radius: 5px;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+    color: #e0e0e0;
+    z-index: 1000;
+}
+
+.legend div {
+    margin: 3px 0;
+    font-size: 12px;
+}
+
+flight_tracker/static/css/controls.css:
+
+css
+
+.controls {
+    background: #2d2d2d;
+    padding: 15px;
+    border-radius: 10px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+}
+
+.controls h2, .controls h3 {
+    margin: 0 0 10px;
+    font-size: 18px;
+    color: #b0b0b0;
+}
+
+.controls h3 {
+    font-size: 16px;
+    margin: 10px 0 5px;
+}
+
+.control-row {
+    display: flex;
+    gap: 10px;
+    margin-bottom: 10px;
+}
+
+.control-row select, .control-row button {
+    padding: 8px;
+    margin: 0;
+    border: 1px solid #555;
+    border-radius: 5px;
+    background: #3c3c3c;
+    color: #e0e0e0;
+    flex: 1;
+    text-align: center;
+}
+
+.control-row button {
+    background: #1a73e8;
+    border: none;
+    cursor: pointer;
+    font-size: 16px;
+}
+
+.control-row button:disabled {
+    background: #555;
+    cursor: not-allowed;
+}
+
+.control-row button:hover:not(:disabled) {
+    background: #1557b0;
+}
+
+.path-checkboxes label {
+    display: block;
+    margin: 5px 0;
+    color: #e0e0e0;
+}
+
+.path-checkboxes input[type="checkbox"] {
+    margin-right: 5px;
+}
+
+.add-class {
+    display: flex;
+    gap: 5px;
+    margin-top: 5px;
+}
+
+.add-class input[type="text"] {
+    flex: 1;
+    padding: 8px;
+    border: 1px solid #555;
+    border-radius: 5px;
+    background: #3c3c3c;
+    color: #e0e0e0;
+}
+
+.add-class button {
+    padding: 8px;
+    background: #1a73e8;
+    border: none;
+    border-radius: 5px;
+    color: #fff;
+    cursor: pointer;
+}
+
+.add-class button:hover {
+    background: #1557b0;
+}
+
+flight_tracker/static/css/flight-list.css:
+
+css
+
+.flight-list {
+    background: #2d2d2d;
+    padding: 15px;
+    border-radius: 10px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    overflow: hidden;
+}
+
+.flight-list h2 {
+    margin: 0 0 10px;
+    font-size: 18px;
+    color: #b0b0b0;
+}
+
+.flight-list input, .flight-list select {
+    padding: 8px 12px;
+    margin: 5px 0;
+    border: 1px solid #555;
+    border-radius: 5px;
+    background: #3c3c3c;
+    color: #e0e0e0;
+    width: 100%;
+    box-sizing: border-box;
+}
+
+.flight-list-scroll {
+    flex: 1;
+    overflow-y: auto;
+    scrollbar-width: thin;
+    scrollbar-color: #555 #333;
+}
+
+.flight-list-scroll::-webkit-scrollbar {
+    width: 8px;
+}
+
+.flight-list-scroll::-webkit-scrollbar-track {
+    background: #333;
+}
+
+.flight-list-scroll::-webkit-scrollbar-thumb {
+    background: #555;
+    border-radius: 4px;
+}
+
+.flight-item {
+    padding: 5px 0;
+    cursor: pointer;
+    color: #e0e0e0;
+}
+
+.flight-item.compact {
+    display: flex;
+    align-items: center;
+    padding: 8px;
+}
+
+.flight-item.compact:hover {
+    background-color: #444;
+}
+
+.flight-item.detailed {
+    padding: 10px;
+    border: 1px solid #555;
+    border-radius: 5px;
+    margin-bottom: 5px;
+}
+
+.flight-item.detailed:hover {
+    background-color: #444;
+}
+
+.flight-item.detailed[style*="background-color"] {
+    background-color: #3c3c3c !important;
+    color: #fff;
+}
+
+.flight-header {
+    display: flex;
+    align-items: center;
+    margin-bottom: 5px;
+}
+
+.flight-data {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    margin-left: 20px;
+}
+
+.flight-data div {
+    display: flex;
+    align-items: center;
+}
+
+.icon {
+    margin-right: 5px;
+}
+
+.source {
+    font-size: 12px;
+    color: #b0b0b0;
+}
+
+flight_tracker/static/css/log.css:
+
+css
+
+.log-container {
+    background: #2d2d2d;
+    padding: 15px;
+    border-top: 1px solid #444;
+    border-radius: 10px 10px 0 0;
+    box-shadow: 0 -2px 4px rgba(0, 0, 0, 0.3);
+}
+
+.log-container h2 {
+    margin: 0 0 10px;
+    font-size: 18px;
+    color: #b0b0b0;
+}
+
+#log {
+    max-height: 150px;
+    overflow-y: auto;
+    font-family: 'Courier New', monospace;
+    background: #333;
+    color: #e0e0e0;
+    padding: 10px;
+    border-radius: 5px;
+    scrollbar-width: thin;
+    scrollbar-color: #555 #333;
+}
+
+#log::-webkit-scrollbar {
+    width: 8px;
+}
+
+#log::-webkit-scrollbar-track {
+    background: #333;
+}
+
+#log::-webkit-scrollbar-thumb {
+    background: #555;
+    border-radius: 4px;
+}
+
+requirements.txt
+
+flask
+flask-socketio
+requests
+sqlalchemy
+scikit-learn
+configparser
+flask_sqlalchemy
+pandas
+numpy
+joblib
+tenacity
+psycopg2-binary
+gunicorn
+eventlet
+
+Dockerfile
+dockerfile
+FROM python:3.12-slim
+
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+RUN apt-get update && apt-get install -y libpq-dev && rm -r /var/lib/apt/lists/*
+
+COPY settings.conf /root/.config/pyopensky/settings.conf
+COPY flight_tracker/ flight_tracker/
+
+VOLUME /data
+
+CMD ["gunicorn", "--worker-class", "eventlet", "-w", "1", "--timeout", "120", "--bind", "0.0.0.0:5000", "flight_tracker.__main__:app"]
+
+docker-compose.yml
+yaml
+
+version: '3.8'
+
+services:
+  app:
+    build: .
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./data:/data
+    depends_on:
+      - postgres
+    environment:
+      - FLASK_ENV=development
+    deploy:
+      resources:
+        limits:
+          memory: 2g # Increase memory limit to 2GB
+          cpus: "2" # Allocate 2 CPUs
+
+  postgres:
+    image: postgres:15
+    environment:
+      - POSTGRES_USER=user
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=flight_tracker
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+volumes:
+  postgres_data:
+
+
+README.md
+markdown
+
+# Flight Tracker Dashboard
+
+A modern, real-time flight tracking application built with Python, Flask, SocketIO, and Leaflet.js. This project fetches flight data from the [OpenSky Network API](https://opensky-network.org/), tracks flight paths over configurable areas.
+
+Developed as a pure AI developed application based on conversations with xAI Grok. 
+
+## Features
+
+- **Real-Time Tracking**: Fetches flight data from OpenSky Network API and updates paths dynamically via SocketIO.
+- **Interactive Map**: Displays flight paths on a Leaflet.js map with color-coded classifications (green for A-to-B, red for survey, grey for other).
+- **Custom Areas**: Define multiple monitoring areas with shift-click on the map; overlapping areas are replaced by the latest.
+- **Flight Classification**:
+  - Rule-based: Uses direction changes, distance, speed, and point density.
+  - ML-based: Trains a Random Forest model on manually labeled data for improved accuracy.
+- **Dashboard UI**: Modern layout with stats (tracked flights, active areas), controls, flight list, and logs.
+- **Manual Overrides**: Adjust flight classifications via dropdowns, feeding data back into ML training.
+- **Data Persistence**: Stores flight paths in SQLite and training data in CSV for ML model retraining.
+- **Optimization**: Handles many flights with cleanup of stale data to prevent crashes.
+
+## Tech Stack
+
+- **Backend**: Flask, Flask-SocketIO, Flask-SQLAlchemy, SQLite, `requests`, scikit-learn
+- **Frontend**: Leaflet.js, HTML/CSS/JavaScript, SocketIO
+- **Container**: Docker (python:3.12-slim)
+- **Dependencies**: See `requirements.txt`
+
+## Prerequisites
+
+- Docker installed
+- OpenSky Network API credentials (username and password)
+- Python 3.12 (if running locally without Docker)
+
+## Setup
+
+### Using Docker (Recommended)
+
+1. **Clone the Repository**
+    ```bash
+    git clone https://github.com/yourusername/flight-tracker.git
+    cd flight-tracker
+    ```
+2. **Configure OpenSky Credentials**
+    - Edit settings.conf with your OpenSky credentials:
+    ```
+    [opensky]
+    username=your_username
+    password=your_password
+    ```
+    - Place it in the project root (it will be copied to /root/.config/pyopensky/settings.conf in the container).
+3. **Build and Run**
+    ```bash
+    docker build -t flight_tracker .
+    docker run -it -p 5000:5000 -p 5678:5678 -v $(pwd)/data:/data flight_tracker
+    ```
+    -p 5000:5000: Exposes the Flask app.
+    -p 5678:5678: Exposes debugpy for VSCode debugging.
+    -v $(pwd)/data:/data: Mounts the data directory for persistent SQLite DB and CSV files.
+
+4. **Access the Dashboard**  
+    Open your browser to http://localhost:5000.
+
+## Local Setup (Alternative)
+1. Clone and Install Dependencies
+    ```bash
+    git clone https://github.com/yourusername/flight-tracker.git
+    cd flight-tracker
+    pip install -r requirements.txt
+    ```
+1. Configure OpenSky Credentials  
+    - Place settings.conf in ~/.config/pyopensky/ with your credentials.
+1. Run the App
+    ```bash
+    python -m flight_tracker
+    ```
+    - Access at http://localhost:5000.
+## Usage
+1. Define Monitoring Areas
+    - Shift-click on the map to start an area, shift-click again to complete it.
+    - Areas are shown with dotted grey borders; overlapping areas replace older ones.
+1. Start Monitoring
+    - Select a frequency (30s, 1m, 5m) and click "Start Monitoring" to begin tracking flights in all defined areas.
+1. View Flights
+    - Flights appear on the map as lines (multi-point) or markers (single-point), color-coded by classification.
+    - Hover over paths for details (flight ID, class, source: ML/rule/manual).
+    - The flight list shows active flights with dropdowns to override classifications.
+1. Train the ML Model
+    - Manually classify flights to populate /data/flight_training_data.csv.
+    - The "Retrain Model" button enables when there are ≥10 flights with >1 unique classification.
+    - Click to train a Random Forest model; check logs for accuracy.
+1. Monitor Logs
+    - Real-time logs appear at the bottom, including data fetches, classifications, and training results.
+## Project Structure
+```
+flight-tracker/
+├── Dockerfile
+├── docker-compose.yml
+├── README.md
+├── requirements.txt
+├── settings.conf.sample  # Rename to settings.conf with credentials
+├── data/                 # Mounted volume
+│   └── flight_data.db
+├── flight_tracker/
+│   ├── __init__.py
+│   ├── __main__.py
+│   ├── analysis.py
+│   ├── ml_model.py
+│   ├── models.py
+│   ├── monitoring.py
+│   ├── routes.py
+│   ├── static/
+│   │   ├── css
+│   │   │   ├── base.css
+│   │   │   ├── log.css
+│   │   │   ├── controls.css
+│   │   │   ├── flight-list.css
+│   │   │   ├── map.css
+│   │   │   └── top-bar.css
+│   │   ├── js
+│   │   │   ├── area_manager.js
+│   │   │   ├── controls.js
+│   │   │   ├── flight_renderer.js
+│   │   │   ├── map_init.js
+│   │   │   ├── simplify.min.js
+│   │   │   ├── socket.js
+│   │   │   └── utils.js
+│   └── templates/
+│       └── index.html
+```
+
+## License
+    This project is licensed under the MIT License - see the LICENSE file for details.
+
+## Acknowledgments
+- OpenSky Network for flight data.
+- Leaflet.js for interactive maps.
+- xAI for inspiration via Grok (used in development).
+
+flight_tracker/__main__.py
+python
+
+from flight_tracker import create_app
+
+if __name__ == '__main__':
+    app, socketio = create_app()
+    socketio.run(app, host='0.0.0.0', port=5000, debug=True)

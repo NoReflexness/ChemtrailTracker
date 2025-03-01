@@ -1,4 +1,4 @@
-const flightLines = {};
+let flightLines = new Set();
 let selectedFlightId = null;
 
 const airplaneSvg = `
@@ -27,7 +27,7 @@ function renderFlightPath(flight) {
         return;
     }
 
-    console.log('Rendering flight:', flight);
+    //console.log('Rendering flight:', flight);
     const sortedPoints = flight.points.slice().sort((a, b) => a[2] - b[2]);
     let coords;
     const isSelected = flight.flight_id === selectedFlightId;
@@ -37,10 +37,8 @@ function renderFlightPath(flight) {
     if (typeof simplify !== 'undefined' && !useFullPoints) {
         const simplifiedPoints = simplify(sortedPoints.map(p => ({ x: p[1], y: p[0], t: p[2], alt: p[3], vel: p[4] })), 0.1, true);
         coords = simplifiedPoints.map(p => [p.y, p.x]);
-        console.log('Coordinates (simplified):', coords);
     } else {
-        coords = sortedPoints.map(p => [p[0], p[1]]); // Use full points for selected or < 200 paths
-        console.log('Coordinates (full):', coords);
+        coords = sortedPoints.map(p => [p[0], p[1]]);
     }
 
     const flightData = flightLines[flight.flight_id] || {};
@@ -55,9 +53,22 @@ function renderFlightPath(flight) {
     const color = flight.classification === 'commercial' ? '#00ff00' :
         flight.classification === 'survey' ? '#ff0000' :
             flight.classification === 'agriculture' ? '#FFA500' :
-                flight.classification === 'cloud seeding' ? '#0000FF' : '#808080';
+                flight.classification === 'cloud seeding' ? '#0000FF' :
+                    flight.classification === 'crop dusting' ? '#FF00FF' :
+                        flight.classification === 'rescue' ? '#FFFF00' :
+                            flight.classification === 'chemtrail' ? '#800080' : '#808080';
     const opacity = isSelected ? 1 : (selectedFlightId ? 0.1 : 0.6);
     let rotation = 0;
+
+    // Pattern detection for visualization
+    let patternStyle = { dashArray: null };
+    if (flight.classification === 'cloud seeding' && isSelected) {
+        patternStyle.dashArray = '10, 5'; // Grid-like
+    } else if (flight.classification === 'crop dusting' && isSelected) {
+        patternStyle.dashArray = '5, 10, 5'; // Zig-zag
+    } else if (flight.classification === 'rescue' && isSelected) {
+        patternStyle.dashArray = '15, 5'; // Circular
+    }
 
     if (coords.length >= 1) {
         const lastPoint = sortedPoints[sortedPoints.length - 1];
@@ -76,7 +87,6 @@ function renderFlightPath(flight) {
                 const [lat1, lon1] = lastPoints[lastPoints.length - 2];
                 rotation = calculateBearing(lat1, lon1, lat2, lon2) - 45;
                 flightData.lastRotation = rotation;
-                console.log('Calculated rotation:', rotation);
             } else {
                 rotation = flightData.lastRotation || 0;
             }
@@ -87,13 +97,17 @@ function renderFlightPath(flight) {
                         if (flightData.line) {
                             flightData.line.setLatLngs(validCoords);
                         } else {
-                            flightData.line = L.polyline(validCoords, { color: color, weight: 4, opacity: opacity });
+                            flightData.line = L.polyline(validCoords, {
+                                color: color,
+                                weight: 4,
+                                opacity: opacity,
+                                dashArray: patternStyle.dashArray
+                            });
                             flightData.line.addTo(flightLayer);
                             flightData.line.on('dblclick', () => selectFlight(flight.flight_id));
                         }
                         flightData.line.bindPopup(popupContent);
-                        flightData.line.setStyle({ opacity: opacity });
-                        console.log('Updated/Added polyline for:', flight.flight_id);
+                        flightData.line.setStyle({ opacity: opacity, dashArray: patternStyle.dashArray });
                     } catch (e) {
                         console.error(`Failed to render polyline for ${flight.flight_id}:`, e);
                         delete flightData.line;
@@ -108,7 +122,6 @@ function renderFlightPath(flight) {
             } else if (flightData.line) {
                 flightLayer.removeLayer(flightData.line);
                 delete flightData.line;
-                console.log(`Removed polyline for ${flight.flight_id} (not selected or category deselected)`);
             }
         }
 
@@ -130,7 +143,6 @@ function renderFlightPath(flight) {
             flightData.marker.on('dblclick', () => selectFlight(flight.flight_id));
             flightData.marker.setOpacity(opacity);
         }
-        console.log('Updated/Added marker for:', flight.flight_id);
     } else {
         console.warn(`No valid coordinates for flight ${flight.flight_id}`);
     }
@@ -138,6 +150,7 @@ function renderFlightPath(flight) {
 
 const debouncedRenderFlightPath = debounce(renderFlightPath, 100);
 window.debouncedRenderFlightPath = renderFlightPath;
+
 
 function selectFlight(flightId) {
     if (!flightId || !flightLines[flightId]) {

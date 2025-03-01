@@ -142,6 +142,7 @@ function updateFlightList() {
 function updateStats() {
     document.getElementById('flight-count').innerText = Object.keys(flightLines).length;
     document.getElementById('area-count').innerText = areas.filter(a => a.is_monitoring).length;
+    console.log('Total flights tracked:', flightLines.size);
 }
 
 function updateClassification(flightId, classification) {

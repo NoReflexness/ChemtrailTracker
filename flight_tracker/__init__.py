@@ -1,31 +1,31 @@
 from flask import Flask
 from flask_socketio import SocketIO
-from sqlalchemy import text
 from flight_tracker.utils import logger, setup_logging
-from flight_tracker.models import db, init_db, FlightPath
+from flight_tracker.models import db, FlightPath
 from flight_tracker.monitoring import init_indexes
-from flight_tracker.analysis import start_buffer_thread  # Import this
+from flight_tracker.analysis import start_buffer_thread
 import json
 import os
 
 def create_app():
     app = Flask(__name__)
-    socketio = SocketIO(app)
+    socketio = SocketIO(app, manage_session=False)  # Disable session management to avoid conflicts
 
     setup_logging(socketio)
 
     from flight_tracker.routes import register_routes
     from flight_tracker.monitoring import start_monitoring
 
-    init_db(app)
+    uri = 'postgresql://user:password@postgres:5432/flight_tracker'
+    logger.info(f"Using database URI: {uri}")
+    app.config['SQLALCHEMY_DATABASE_URI'] = uri
+    app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+    db.init_app(app)
     
     with app.app_context():
-        # Enable WAL mode
-        db.session.execute(text("PRAGMA journal_mode=WAL"))
-        db.session.commit()
+        db.create_all()
         
-        init_indexes()
-        for flight in FlightPath.query.all():
+        for flight in db.session.query(FlightPath).all():
             try:
                 points = json.loads(flight.points) if flight.points else []
                 if not isinstance(points, list) or (points and not all(isinstance(p, list) for p in points)):
@@ -38,7 +38,7 @@ def create_app():
                 flight.points = json.dumps([])
                 db.session.commit()
 
-        if not FlightPath.query.first() and os.path.exists('initial_data.json'):
+        if not db.session.query(FlightPath).first() and os.path.exists('initial_data.json'):
             try:
                 with open('initial_data.json', 'r') as f:
                     data = json.load(f)
@@ -60,6 +60,7 @@ def create_app():
                 logger.warning("initial_data.json not found, skipping initial data load")
             except Exception as e:
                 logger.error(f"Failed to load initial data: {e}")
+                db.session.rollback()
 
     register_routes(app, socketio)
     start_buffer_thread(socketio)
@@ -68,5 +69,13 @@ def create_app():
     def handle_connect():
         logger.info("Client connected")
         start_monitoring(app, socketio)
+
+    @socketio.on('disconnect')
+    def handle_disconnect(arg=None):
+        logger.info("Client disconnected")
+
+    @socketio.on_error_default
+    def handle_error(e):
+        logger.error(f"Socket.IO error: {e}")
 
     return app, socketio

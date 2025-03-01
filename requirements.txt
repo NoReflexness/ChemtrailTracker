@@ -8,3 +8,7 @@ flask_sqlalchemy
 pandas
 numpy
 joblib
+tenacity
+psycopg2-binary
+gunicorn
+eventlet
